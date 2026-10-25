@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Persona Studio",
+    "description": "Bind a persona card per session. After switching, the model receives structured self-knowledge — temperament, tastes, habits and history — and refines it through chat."
+  }
+}
