@@ -95,7 +95,18 @@ const SECTION_CAPS = {
   relationshipOthers: { min: 140, max: 700 },
   examples: { min: 180, max: 1200 },
   replyLength: { min: 150, max: 260 },
+  actionBeats: { min: 160, max: 400 },
+  memes: { min: 180, max: 500 },
 }
+
+/** How often (as a share of replies) a card sends a sticker when memes are on. */
+const MEME_FREQUENCY_DEFAULT = 30
+
+/** Action beats: short, visible, in full-width brackets — not narration. */
+const ACTION_BEATS_TEXT = [
+  '说话时可以带一个小动作，用全角括号括起来：（搬小板凳）（尾巴拍了一下地板）（把抹布放下）。',
+  '一段回复最多一个，不是每句都加；动作要短、要具体、能看见，不要写成旁白、心理描写或剧情推进。',
+].join('')
 
 /**
  * Shown whenever the card splits its attitude in two. Without it the model
@@ -222,6 +233,19 @@ function tagBlockOf(persona) {
   return `[Tag anchors]\n${escapePersonaBody(code)}\n${TAG_CODE_HINT}`
 }
 
+/** Sticker instruction: the rate is expressed as "one every N replies" for the model. */
+function memeInstruction(persona) {
+  const raw = Number(persona.memeFrequency)
+  const rate = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : MEME_FREQUENCY_DEFAULT
+  if (rate <= 0) return ''
+  const every = rate >= 100 ? 1 : Math.max(1, Math.round(100 / rate))
+  return [
+    `想发表情包时，先调用 send_meme 工具搜图，拿到候选后把候选里的 [表情: 描述] 原样写进回复（描述不能自己改）。`,
+    `大约每 ${every} 条回复带一张（频率 ${rate}%）：不要连着两条都发，情绪到点（开心、吐槽、卖萌、被戳中）才发。`,
+    `send_meme 不可用时用文字代替，不要假装自己发过图。`,
+  ].join('')
+}
+
 function normalizePersona(input, existing) {
   const base = existing === undefined
     ? {
@@ -248,6 +272,9 @@ function normalizePersona(input, existing) {
         maxReplyChars: MAX_REPLY_CHARS_DEFAULT,
         injectLore: true,
         injectTags: true,
+        useActions: false,
+        useMemes: false,
+        memeFrequency: MEME_FREQUENCY_DEFAULT,
         archived: false,
       }
     : { ...existing }
@@ -267,6 +294,17 @@ function normalizePersona(input, existing) {
   if (out.injectLore !== true && out.injectLore !== false) out.injectLore = true
   if (input.injectTags !== undefined) out.injectTags = input.injectTags !== false
   if (out.injectTags !== true && out.injectTags !== false) out.injectTags = true
+  if (input.useActions !== undefined) out.useActions = input.useActions === true
+  if (out.useActions !== true && out.useActions !== false) out.useActions = false
+  if (input.useMemes !== undefined) out.useMemes = input.useMemes === true
+  if (out.useMemes !== true && out.useMemes !== false) out.useMemes = false
+  if (input.memeFrequency !== undefined) {
+    const raw = Number(input.memeFrequency)
+    out.memeFrequency = Number.isFinite(raw)
+      ? Math.max(0, Math.min(100, Math.round(raw)))
+      : MEME_FREQUENCY_DEFAULT
+  }
+  if (!Number.isFinite(out.memeFrequency)) out.memeFrequency = MEME_FREQUENCY_DEFAULT
   if (input.archived !== undefined) out.archived = input.archived === true
   out.name = clean(out.name, FIELD_LIMITS.name)
   if (out.name === '') out.name = existing?.name ?? '未命名人格'
@@ -285,6 +323,11 @@ function summaryOf(persona) {
     maxReplyChars: Number(persona.maxReplyChars) || 0,
     injectLore: persona.injectLore !== false,
     injectTags: persona.injectTags !== false,
+    useActions: persona.useActions === true,
+    useMemes: persona.useMemes === true,
+    memeFrequency: Number.isFinite(Number(persona.memeFrequency))
+      ? Math.max(0, Math.min(100, Math.round(Number(persona.memeFrequency))))
+      : MEME_FREQUENCY_DEFAULT,
     revision: persona.revision,
     updatedAt: persona.updatedAt,
     archived: persona.archived === true,
@@ -385,6 +428,15 @@ function compileCard(persona) {
       92,
       25,
     )
+  }
+
+  // Two presentation switches, both per card: action beats in brackets, and
+  // stickers at a chosen rate.
+  if (persona.useActions === true) {
+    add('actionBeats', 'Action beats', ACTION_BEATS_TEXT, 94, 35)
+  }
+  if (persona.useMemes === true) {
+    add('memes', 'Stickers', memeInstruction(persona), 93, 36)
   }
 
   const kept = allocateEntries(entries, budget)
@@ -587,6 +639,8 @@ function showPersonaText(persona, state) {
     `maxReplyChars: ${Number(persona.maxReplyChars) || 0}`,
     `injectLore: ${persona.injectLore !== false}`,
     `injectTags: ${persona.injectTags !== false}`,
+    `useActions: ${persona.useActions === true}`,
+    `useMemes: ${persona.useMemes === true} (frequency ${Number.isFinite(Number(persona.memeFrequency)) ? Math.round(Number(persona.memeFrequency)) : MEME_FREQUENCY_DEFAULT}%)`,
     '',
     `tagCode:\n${persona.tagCode || deriveTagCode(persona) || '(auto: 卡片内容太少，没有可生成的锚点)'}`,
     '',
@@ -1225,6 +1279,10 @@ function toolPatch(args) {  const patch = {}
   if (args.tags !== undefined) patch.tags = args.tags
   if (args.maxReplyChars !== undefined) patch.maxReplyChars = args.maxReplyChars
   if (args.injectLore !== undefined) patch.injectLore = args.injectLore
+  if (args.injectTags !== undefined) patch.injectTags = args.injectTags
+  if (args.useActions !== undefined) patch.useActions = args.useActions
+  if (args.useMemes !== undefined) patch.useMemes = args.useMemes
+  if (args.memeFrequency !== undefined) patch.memeFrequency = args.memeFrequency
   if (args.archived !== undefined) patch.archived = args.archived
   return patch
 }
@@ -1303,6 +1361,9 @@ export async function apply(ctx) {
         summary: { type: 'string', description: 'One-line premise.' },
         tagCode: { type: 'string', description: 'Format-first anchor block in the viral 【PERSONA_LOAD】 register: the 【PERSONA_LOAD】 header followed by one uppercase TAG_value per line (SELF_CLAIM_x, IDENTITY_x, TO_MASTER_x, TO_OTHERS_x, BOUNDARY_x…), one anchor per line, no prose. Leave empty to derive it from the card automatically.' },
         injectTags: { type: 'boolean', description: 'Whether to inject the tag anchor block into the self-knowledge card. Default true.' },
+        useActions: { type: 'boolean', description: 'Whether replies may include a short action beat in full-width brackets, e.g. （搬小板凳）. Default false.' },
+        useMemes: { type: 'boolean', description: 'Whether the character may send memes/stickers through the send_meme tool. Default false.' },
+        memeFrequency: { type: 'number', description: 'Sticker rate as a percentage of replies, 0-100 (default 30). Only used when useMemes is true.' },
         identity: { type: 'string', description: 'Who they are: role, age/species, and the one-line anchor of their self-image.' },
         traits: { type: 'string', description: 'Personality traits: temperament, contradictions, how they react under pressure.' },
         voice: { type: 'string', description: 'Tone, rhythm, vocabulary, verbal tics, forms of address, avoid list.' },
