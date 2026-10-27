@@ -52,6 +52,7 @@ const TEXT_FIELDS = [
   'habits',
   'drives',
   'relationship',
+  'relationshipOthers',
   'boundaries',
   'knowledge',
   'examples',
@@ -68,6 +69,7 @@ const FIELD_LIMITS = {
   habits: 700,
   drives: 900,
   relationship: 800,
+  relationshipOthers: 800,
   boundaries: 800,
   knowledge: 700,
   examples: 1400,
@@ -88,9 +90,20 @@ const SECTION_CAPS = {
   boundaries: { min: 180, max: 800 },
   knowledge: { min: 140, max: 700 },
   relationship: { min: 160, max: 800 },
+  relationshipOthers: { min: 140, max: 700 },
   examples: { min: 180, max: 1200 },
   replyLength: { min: 150, max: 260 },
 }
+
+/**
+ * Shown whenever the card splits its attitude in two. Without it the model
+ * tends to blend the two audiences and treats a stranger like its master.
+ */
+const WHO_IS_WHO = [
+  '分清面前的是谁：主人就是选中你、把这张卡绑在自己身上的那个人（群聊里若消息前缀标了「主人」，那就是他）；',
+  '其他人是主人之外的所有人——群友、陌生人、客人、路过围观的人。',
+  '对这两类人，你的称呼、亲疏、让步尺度和耐心都不一样，不要混着用；拿不准对方是谁时，先按“其他人”的分寸来。',
+].join('')
 
 const STOP_TOKENS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'you', 'your', 'are', 'was',
@@ -122,6 +135,30 @@ function cleanTags(value) {
   return out
 }
 
+/**
+ * Tool results have to survive JSON serialization exactly. A key whose value is
+ * `undefined` (an optional field that only sometimes exists) makes the harness
+ * reject the whole result as "not lossless JSON", so drop such keys instead of
+ * setting them to undefined.
+ */
+function jsonSafe(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => (
+      item === undefined || (typeof item === 'number' && !Number.isFinite(item)) ? null : jsonSafe(item)
+    ))
+  }
+  if (value !== null && typeof value === 'object') {
+    const out = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (item === undefined) continue
+      if (typeof item === 'number' && !Number.isFinite(item)) continue
+      out[key] = jsonSafe(item)
+    }
+    return out
+  }
+  return value
+}
+
 function normalizePersona(input, existing) {
   const base = existing === undefined
     ? {
@@ -138,6 +175,7 @@ function normalizePersona(input, existing) {
         habits: '',
         drives: '',
         relationship: '',
+        relationshipOthers: '',
         boundaries: '',
         knowledge: '',
         examples: '',
@@ -254,7 +292,16 @@ function compileCard(persona) {
   add('drives', 'Wants', persona.drives, 84, 70)
   add('boundaries', 'Boundaries', persona.boundaries, 76, 90)
   add('knowledge', 'Knowledge', persona.knowledge, 70, 100)
-  add('relationship', 'Relationship', persona.relationship, 64, 110)
+  // One character, two audiences: the master who owns this card and everybody
+  // else. They are injected as separate sections so a long “strangers” block
+  // can never eat the “master” instruction (and vice versa).
+  const towardMaster = clean(persona.relationship, FIELD_LIMITS.relationship)
+  const towardOthers = clean(persona.relationshipOthers, FIELD_LIMITS.relationshipOthers)
+  if (towardMaster !== '' || towardOthers !== '') {
+    add('relationshipNote', 'Who is in front of you', WHO_IS_WHO, 86, 105)
+  }
+  add('relationship', 'Toward your master', towardMaster, 84, 110)
+  add('relationshipOthers', 'Toward everyone else', towardOthers, 82, 111)
   add('examples', 'Examples', persona.examples, 58, 120)
 
   const maxReplyChars = Math.max(0, Math.min(MAX_REPLY_CHARS_LIMIT, Number(persona.maxReplyChars) || 0))
@@ -421,7 +468,7 @@ function compileRuntime(persona, state, query, current = Date.now()) {
   if (mood !== '') blocks.push(`[Mood]\n${escapePersonaBody(mood)}`)
   const relationship = clean(state?.relationship, 500)
   if (relationship !== '' && relationship !== clean(persona.relationship, 500)) {
-    blocks.push(`[Relationship right now]\n${escapePersonaBody(relationship)}`)
+    blocks.push(`[Your standing with your master right now]\n${escapePersonaBody(relationship)}`)
   }
 
   const { picked, omitted, chars } = selectNotes(state, query, current)
@@ -483,6 +530,8 @@ function showPersonaText(persona, state) {
     `drives:\n${persona.drives || '(empty)'}`,
     '',
     `relationship:\n${persona.relationship || '(empty)'}`,
+    '',
+    `relationshipOthers:\n${persona.relationshipOthers || '(empty)'}`,
     '',
     `boundaries:\n${persona.boundaries || '(empty)'}`,
     '',
@@ -962,6 +1011,7 @@ const ENRICH_FIELDS = [
   'habits',
   'drives',
   'relationship',
+  'relationshipOthers',
   'boundaries',
   'knowledge',
   'examples',
@@ -1056,8 +1106,9 @@ async function enrichPersona(ctx, store, agent, ref, overwrite) {
   const system = [
     '你是一个角色设定编辑。你的任务是根据已有资料，补全一个角色的“自我认知”，让另一个模型能像她本人一样自然地说话、反应和回忆。',
     '只输出一个 JSON 对象，不要 Markdown 代码围栏，不要解释。',
-    'JSON 的键固定为：identity, traits, voice, likes, dislikes, habits, drives, relationship, boundaries, knowledge, examples, lore。',
+    'JSON 的键固定为：identity, traits, voice, likes, dislikes, habits, drives, relationship, relationshipOthers, boundaries, knowledge, examples, lore。',
     '每个值都是中文字符串。没有把握的字段给空字符串；不要编造会与已有资料冲突的事实。',
+    '关系分成两类人写：relationship 写她对主人（选中、绑定这张卡的人）的态度——称呼、亲疏、依赖或顶撞的方式、愿意为他做到什么程度；relationshipOthers 写她对其他人（群友、陌生人、客人、围观者）的态度——礼貌、冷淡、戒备、敷衍还是逗弄，边界在哪。两者要形成明显反差，不要写成同一段话。',
     '要求：具体、可演、有细节。不要写“温柔善良”这类空泛形容词，要写她在具体情境里会怎么反应。',
     '除 examples 外，用第二人称“你”描述（lore 可以用第一人称“我”回忆）；不要写成第三方人物小传。',
     'traits 写性格与矛盾；likes/dislikes 写具体的人、物、活动；habits 写小动作和口头习惯；lore 写她自己的过去（第一人称经历）。',
@@ -1160,9 +1211,9 @@ export async function apply(ctx) {
     },
   }), 'dsh-persona: prompt context')
 
-  ctx.effect(() => ctx.tools.register({
+  const personaTool = {
     name: 'persona',
-    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
+    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1182,7 +1233,8 @@ export async function apply(ctx) {
         dislikes: { type: 'string', description: 'Things they avoid, fear or get irritated by.' },
         habits: { type: 'string', description: 'Recurring habits, mannerisms and small rituals.' },
         drives: { type: 'string', description: 'Goals, fears, values, contradictions, what they want from the scene.' },
-        relationship: { type: 'string', description: 'Default stance toward the user and how familiarity changes it.' },
+        relationship: { type: 'string', description: 'How they treat their master — the person who picked them and bound this card: forms of address, closeness, how they obey or push back, what they would do for the master.' },
+        relationshipOthers: { type: 'string', description: 'How they treat everyone who is not the master — group members, strangers, guests, onlookers: politeness, distance, wariness or teasing. Keep it clearly different from relationship.' },
         boundaries: { type: 'string', description: 'Hard limits, taboos, topics they deflect, behavior they never do.' },
         knowledge: { type: 'string', description: 'What they know and do not know; prevents anachronistic or omniscient behavior.' },
         examples: { type: 'string', description: 'Two to four short example lines that anchor the voice.' },
@@ -1357,7 +1409,11 @@ export async function apply(ctx) {
 
       throw new Error(`不支持的人格操作：${action}`)
     },
-  }), 'dsh-persona: tool')
+  }
+
+  const rawExecute = personaTool.execute
+  personaTool.execute = async (args, exec) => jsonSafe(await rawExecute(args, exec))
+  ctx.effect(() => ctx.tools.register(personaTool), 'dsh-persona: tool')
 
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => commandCtx.commands.register({
@@ -1598,6 +1654,7 @@ export const __test = {
   allocateEntries,
   enrichPersona,
   normalizePersona,
+  jsonSafe,
   PersonaStore,
   DOMAIN_SPEC,
 }
