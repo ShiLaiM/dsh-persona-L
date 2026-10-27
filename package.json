@@ -1,6 +1,6 @@
-﻿{
+{
   "name": "@local/dsh-persona",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Session-scoped persona cards that give the model a substantial, structured sense of its own personality",
   "license": "MIT",
   "repository": {

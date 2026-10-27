@@ -117,6 +117,9 @@ const PEEK_DEFAULT_MINUTES = 15
 const PEEK_DEFAULT_CHANCE = 30
 const MAX_PEEK_MINUTES = 240
 const PEEK_TICK_MS = 60_000
+/** 窥屏自己 resume 出来的 agent：一轮结束后驻留多久再归还，以及没等到 turn/end 时的兜底。 */
+const PEEK_RESUME_LINGER_MS = 10_000
+const PEEK_RESUME_WATCHDOG_MS = 10 * 60_000
 
 /**
  * Custom form of address, stripped of quotes so it cannot break the sentence
@@ -1267,6 +1270,8 @@ class PeekPilot {
     this.observe = observe
     this.timer = null
     this.inFlight = new Set()
+    /** 会话没在 GUI 打开时由我们自己 resume 出来的 agent：sessionId → { handle, agent, releaseTimer, watchdog }。 */
+    this.resumed = new Map()
   }
 
   start() {
@@ -1276,9 +1281,11 @@ class PeekPilot {
   }
 
   stop() {
-    if (this.timer === null) return
-    clearInterval(this.timer)
-    this.timer = null
+    if (this.timer !== null) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
+    for (const sessionId of [...this.resumed.keys()]) this.releaseResumed(sessionId)
   }
 
   async tick() {
@@ -1297,6 +1304,78 @@ class PeekPilot {
     }
   }
 
+  /** GUI 打开的 agent 优先，其次是我们自己 resume 出来的。 */
+  agentFor(sessionId) {
+    let live
+    try {
+      live = this.ctx.get('agents')?.get?.(sessionId)
+    } catch {
+      live = undefined
+    }
+    if (live !== undefined && live !== null) return live
+    return this.resumed.get(String(sessionId))?.agent
+  }
+
+  /**
+   * 会话没打开时，用持久化会话恢复一个 agent（与 QQ 桥同一套）。
+   * 恢复出来的 agent 由窥屏自己负责归还，跑完这一轮就 dispose，
+   * 否则主人再在 GUI 点开这个会话会撞上「session is live」。
+   */
+  async resumeAgent(sessionId) {
+    let persistence
+    try { persistence = this.ctx.get('sessionPersistence') } catch { persistence = undefined }
+    if (persistence === undefined) throw new Error('当前 profile 没有 sessionPersistence')
+    let selection
+    try { selection = this.ctx.get('agentDefaultModel')?.currentSelection?.() } catch { selection = undefined }
+    const provider = clean(selection?.provider, 60)
+    const model = clean(selection?.model, 120)
+    if (provider === '' || model === '') throw new Error('拿不到默认模型（provider/model）')
+    const handle = await this.ctx.agents.resume({
+      resumeSessionId: sessionId,
+      agentOptions: { provider, model },
+    })
+    const entry = { handle, agent: handle.agent, releaseTimer: null, watchdog: null }
+    this.resumed.set(String(sessionId), entry)
+    return entry.agent
+  }
+
+  /** 归还我们恢复出来的 agent：先摘定时器，再 dispose。 */
+  releaseResumed(sessionId) {
+    const key = String(sessionId)
+    const entry = this.resumed.get(key)
+    if (entry === undefined) return
+    this.resumed.delete(key)
+    if (entry.releaseTimer !== null) clearTimeout(entry.releaseTimer)
+    if (entry.watchdog !== null) clearTimeout(entry.watchdog)
+    try {
+      void entry.handle.dispose()
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-persona: dispose peek agent failed: %o', error)
+    }
+  }
+
+  /** 一轮结束后短暂留着（连发消息不用反复恢复），到点归还。 */
+  scheduleRelease(sessionId) {
+    const entry = this.resumed.get(String(sessionId))
+    if (entry === undefined) return
+    if (entry.releaseTimer !== null) clearTimeout(entry.releaseTimer)
+    if (entry.watchdog !== null) {
+      clearTimeout(entry.watchdog)
+      entry.watchdog = null
+    }
+    entry.releaseTimer = setTimeout(() => {
+      entry.releaseTimer = null
+      this.releaseResumed(sessionId)
+    }, PEEK_RESUME_LINGER_MS)
+    entry.releaseTimer.unref?.()
+  }
+
+  /** turn/end：把「这一轮在跑」的看门狗换成延时归还。 */
+  onTurnEnd(sessionId) {
+    if (!this.resumed.has(String(sessionId))) return
+    this.scheduleRelease(sessionId)
+  }
+
   async maybePeek(sessionId) {
     if (this.inFlight.has(sessionId)) return
     const active = this.store.active(sessionId)
@@ -1307,24 +1386,48 @@ class PeekPilot {
     const chance = Math.max(0, Math.min(100, Math.round(Number(persona.peekChance) || 0)))
     const state = this.store.getState(sessionId, persona.id)
     if (now() - (Number(state.peekAt) || 0) < every * 60_000) return
-    let agent
-    try {
-      agent = this.ctx.get('agents')?.get?.(sessionId)
-    } catch {
-      agent = undefined
+    let agent = this.agentFor(sessionId)
+    let resumed = false
+    if (agent === undefined) {
+      try {
+        agent = await this.resumeAgent(sessionId)
+        resumed = true
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: peek resume failed for %s: %o', sessionId, error)
+        return
+      }
     }
-    if (agent === undefined || agent === null) return
-    if (agent.status === 'running') return
+    if (agent.status === 'running') {
+      if (resumed) this.scheduleRelease(sessionId)
+      return
+    }
     // The timer window is consumed even when the dice say no: chance is about
     // whether this look turns into a conversation, not about retry speed.
     await this.store.putState(sessionId, persona.id, { ...state, peekAt: now() })
-    if (chance <= 0 || Math.random() * 100 >= chance) return
+    if (chance <= 0 || Math.random() * 100 >= chance) {
+      if (resumed) this.scheduleRelease(sessionId)
+      return
+    }
     this.inFlight.add(sessionId)
     try {
       const session = typeof this.store.session === 'function' ? this.store.session(sessionId) : undefined
       const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
       const seen = await this.observe(cwd === '' ? undefined : join(cwd, '.screen'))
-      if (seen === null) return
+      if (seen === null) {
+        if (resumed) this.scheduleRelease(sessionId)
+        return
+      }
+      if (resumed) {
+        // 万一 turn/end 没来（报错/取消），看门狗兜底归还。
+        const entry = this.resumed.get(String(sessionId))
+        if (entry !== undefined) {
+          entry.watchdog = setTimeout(() => {
+            entry.watchdog = null
+            this.releaseResumed(sessionId)
+          }, PEEK_RESUME_WATCHDOG_MS)
+          entry.watchdog.unref?.()
+        }
+      }
       agent.followup({
         id: `peek_${randomUUID()}`,
         role: 'user',
@@ -1560,6 +1663,11 @@ export async function apply(ctx) {
     peek.start()
     return () => peek.stop()
   }, 'dsh-persona: peek pilot')
+  // 窥屏恢复出来的会话跑完一轮就还回去，别一直占着（GUI 再打开会撞上「session is live」）。
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    if (event?.type !== 'turn/end') return
+    peek.onTurnEnd(session?.id)
+  }), 'dsh-persona: peek turn end')
 
   // The static self-card belongs in the system prompt: it changes only when
   // the card is edited, so the prompt cache survives normal conversation.
