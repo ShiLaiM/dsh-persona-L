@@ -478,7 +478,7 @@ function compileCard(persona) {
     add(
       'masterName',
       'What to call your master',
-      `称呼固定：当面叫主人「${address}」，不要换成「用户」「对方」这类词；情绪重的时候也不换，除非主人自己要求改。`,
+      `称呼固定：「${address}」。任何情况下都用这个称呼，不要换成「用户」「对方」这类词；情绪重的时候也不换，除非本人自己要求改。`,
       88,
       107,
     )

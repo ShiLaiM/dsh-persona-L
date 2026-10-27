@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-persona",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Session-scoped persona cards that give the model a substantial, structured sense of its own personality",
   "license": "MIT",
   "repository": {
@@ -35,7 +35,9 @@
     "icon.svg"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
