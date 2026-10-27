@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1204,21 +1204,32 @@ try {
 @{ title = $title.ToString(); process = $proc; shot = $shot } | ConvertTo-Json -Compress
 `
 
-function runPeekScript(shotPath) {
-  return new Promise((resolve, reject) => {
-    const script = PEEK_SCRIPT.replace('SHOT_PATH', `'${shotPath.replace(/'/g, "''")}'`)
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', script],
-      { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error !== null) {
-          reject(error)
-          return
-        }
-        resolve(String(stdout ?? ''))
-      },
-    )
+function runPeekScript(shotPath, scriptPath) {
+  // Write the script to a file and run it with -File: passing this many lines
+  // (here-strings included) through -Command is where quoting goes to die.
+  const script = PEEK_SCRIPT.replaceAll('SHOT_PATH', `'${shotPath.replace(/'/g, "''")}'`)
+  return new Promise((resolve) => {
+    void (async () => {
+      try {
+        // Windows PowerShell 5.1 needs a BOM to read the UTF-8 script correctly.
+        await writeFile(scriptPath, `\uFEFF${script}`, 'utf8')
+      } catch (error) {
+        resolve({ error: `写脚本失败：${error instanceof Error ? error.message : String(error)}`, stdout: '' })
+        return
+      }
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+        { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) => {
+          const tail = String(stderr ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 300)
+          resolve({
+            error: error === null ? '' : `${error.message}${tail === '' ? '' : ` | ${tail}`}`,
+            stdout: String(stdout ?? ''),
+          })
+        },
+      )
+    })()
   })
 }
 
@@ -1229,27 +1240,27 @@ function runPeekScript(shotPath) {
  * title-only observation instead of failing the whole peek.
  */
 async function observeScreen(dir = join(tmpdir(), 'dsh-persona-peek')) {
-  if (process.platform !== 'win32') return null
+  if (process.platform !== 'win32') return { ok: false, error: '窥屏只支持 Windows' }
   const shot = join(dir, `peek-${now()}.png`)
+  const scriptPath = join(dir, 'peek.ps1')
   try {
     await mkdir(dir, { recursive: true })
-    const stdout = await runPeekScript(shot)
-    const parsed = JSON.parse(stdout.trim().split('\n').pop() || '{}')
+    const run = await runPeekScript(shot, scriptPath)
+    if (run.error !== '') return { ok: false, error: run.error }
+    const parsed = JSON.parse(String(run.stdout).trim().split('\n').pop() || '{}')
     const title = clean(parsed.title, 200)
     const proc = clean(parsed.process, 80)
     let kept = ''
-    if (title !== '' || proc !== '') {
-      try {
-        await readFile(shot)
-        kept = shot
-      } catch {
-        kept = ''
-      }
-      return { title, process: proc, shot: kept }
+    try {
+      await readFile(shot)
+      kept = shot
+    } catch {
+      kept = ''
     }
-    return null
-  } catch {
-    return null
+    if (title === '' && proc === '' && kept === '') return { ok: false, error: '没抓到前台窗口' }
+    return { ok: true, seen: { title, process: proc, shot: kept } }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -1403,7 +1414,7 @@ class PeekPilot {
     }
     // The timer window is consumed even when the dice say no: chance is about
     // whether this look turns into a conversation, not about retry speed.
-    await this.store.putState(sessionId, persona.id, { ...state, peekAt: now() })
+    await this.store.putState(sessionId, persona.id, { ...state, peekAt: now(), peekError: '' })
     if (chance <= 0 || Math.random() * 100 >= chance) {
       if (resumed) this.scheduleRelease(sessionId)
       return
@@ -1412,11 +1423,18 @@ class PeekPilot {
     try {
       const session = typeof this.store.session === 'function' ? this.store.session(sessionId) : undefined
       const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
-      const seen = await this.observe(cwd === '' ? undefined : join(cwd, '.screen'))
-      if (seen === null) {
+      const result = await this.observe(cwd === '' ? undefined : join(cwd, '.screen'))
+      if (result === null || result.ok !== true) {
+        // Keep the reason on the session state so it is diagnosable without logs.
+        const reason = result === null ? '观察失败' : String(result.error ?? '观察失败')
+        await this.store.putState(sessionId, persona.id, {
+          ...this.store.getState(sessionId, persona.id),
+          peekError: reason.slice(0, 300),
+        })
         if (resumed) this.scheduleRelease(sessionId)
         return
       }
+      const seen = result.seen
       if (resumed) {
         // 万一 turn/end 没来（报错/取消），看门狗兜底归还。
         const entry = this.resumed.get(String(sessionId))
