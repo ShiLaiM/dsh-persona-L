@@ -1,4 +1,8 @@
+import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { mkdir, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 /**
  * Persona Studio.
@@ -107,6 +111,12 @@ const MEME_FREQUENCY_DEFAULT = 30
 
 /** Default way of addressing the person who bound the card. */
 const MASTER_NAME_DEFAULT = '主人'
+
+/** Peek pilot: look at the master's screen on a timer and decide to speak up. */
+const PEEK_DEFAULT_MINUTES = 15
+const PEEK_DEFAULT_CHANCE = 30
+const MAX_PEEK_MINUTES = 240
+const PEEK_TICK_MS = 60_000
 
 /**
  * Custom form of address, stripped of quotes so it cannot break the sentence
@@ -296,6 +306,9 @@ function normalizePersona(input, existing) {
         useActions: false,
         useMemes: false,
         memeFrequency: MEME_FREQUENCY_DEFAULT,
+        peekEnabled: false,
+        peekEveryMinutes: PEEK_DEFAULT_MINUTES,
+        peekChance: PEEK_DEFAULT_CHANCE,
         archived: false,
       }
     : { ...existing }
@@ -327,6 +340,20 @@ function normalizePersona(input, existing) {
       : MEME_FREQUENCY_DEFAULT
   }
   if (!Number.isFinite(out.memeFrequency)) out.memeFrequency = MEME_FREQUENCY_DEFAULT
+  if (input.peekEnabled !== undefined) out.peekEnabled = input.peekEnabled === true
+  if (out.peekEnabled !== true && out.peekEnabled !== false) out.peekEnabled = false
+  if (input.peekEveryMinutes !== undefined) {
+    const raw = Number(input.peekEveryMinutes)
+    out.peekEveryMinutes = Number.isFinite(raw)
+      ? Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(raw)))
+      : PEEK_DEFAULT_MINUTES
+  }
+  if (!Number.isFinite(out.peekEveryMinutes)) out.peekEveryMinutes = PEEK_DEFAULT_MINUTES
+  if (input.peekChance !== undefined) {
+    const raw = Number(input.peekChance)
+    out.peekChance = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : PEEK_DEFAULT_CHANCE
+  }
+  if (!Number.isFinite(out.peekChance)) out.peekChance = PEEK_DEFAULT_CHANCE
   if (input.archived !== undefined) out.archived = input.archived === true
   out.name = clean(out.name, FIELD_LIMITS.name)
   if (out.name === '') out.name = existing?.name ?? '未命名人格'
@@ -351,6 +378,13 @@ function summaryOf(persona) {
     memeFrequency: Number.isFinite(Number(persona.memeFrequency))
       ? Math.max(0, Math.min(100, Math.round(Number(persona.memeFrequency))))
       : MEME_FREQUENCY_DEFAULT,
+    peekEnabled: persona.peekEnabled === true,
+    peekEveryMinutes: Number.isFinite(Number(persona.peekEveryMinutes))
+      ? Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(Number(persona.peekEveryMinutes))))
+      : PEEK_DEFAULT_MINUTES,
+    peekChance: Number.isFinite(Number(persona.peekChance))
+      ? Math.max(0, Math.min(100, Math.round(Number(persona.peekChance))))
+      : PEEK_DEFAULT_CHANCE,
     revision: persona.revision,
     updatedAt: persona.updatedAt,
     archived: persona.archived === true,
@@ -676,6 +710,7 @@ function showPersonaText(persona, state) {
     `injectTags: ${persona.injectTags !== false}`,
     `useActions: ${persona.useActions === true}`,
     `useMemes: ${persona.useMemes === true} (frequency ${Number.isFinite(Number(persona.memeFrequency)) ? Math.round(Number(persona.memeFrequency)) : MEME_FREQUENCY_DEFAULT}%)`,
+    `peek: ${persona.peekEnabled === true ? 'on' : 'off'} (every ${Number(persona.peekEveryMinutes) || PEEK_DEFAULT_MINUTES} min, ${Number(persona.peekChance) || 0}% to speak)`,
     '',
     `tagCode:\n${persona.tagCode || deriveTagCode(persona) || '(auto: 卡片内容太少，没有可生成的锚点)'}`,
     '',
@@ -1127,6 +1162,181 @@ class PersonaStore {
   }
 }
 
+/**
+ * Peek pilot: on a timer, look at what the master is doing and decide whether
+ * to start a conversation. Off by default; only the foreground window and one
+ * screenshot are read, and only while the bound agent is idle.
+ */
+const PEEK_SCRIPT = String.raw`
+$ErrorActionPreference = 'Continue'
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class PeekWin {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+}
+"@
+$handle = [PeekWin]::GetForegroundWindow()
+$title = New-Object System.Text.StringBuilder 512
+[void][PeekWin]::GetWindowText($handle, $title, 512)
+$owner = 0
+[void][PeekWin]::GetWindowThreadProcessId($handle, [ref]$owner)
+$proc = ''
+try { $proc = (Get-Process -Id $owner -ErrorAction Stop).ProcessName } catch { $proc = '' }
+$shot = ''
+try {
+  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+  $graphics.Dispose()
+  $bitmap.Save(SHOT_PATH, [System.Drawing.Imaging.ImageFormat]::Png)
+  $bitmap.Dispose()
+  $shot = SHOT_PATH
+} catch { $shot = '' }
+@{ title = $title.ToString(); process = $proc; shot = $shot } | ConvertTo-Json -Compress
+`
+
+function runPeekScript(shotPath) {
+  return new Promise((resolve, reject) => {
+    const script = PEEK_SCRIPT.replace('SHOT_PATH', `'${shotPath.replace(/'/g, "''")}'`)
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error !== null) {
+          reject(error)
+          return
+        }
+        resolve(String(stdout ?? ''))
+      },
+    )
+  })
+}
+
+/**
+ * Foreground window title, process name and a screenshot path. The screenshot
+ * goes into the session workspace (`.screen/`) rather than the system temp dir,
+ * because some hosts sandbox temp writes out; a failed capture degrades to a
+ * title-only observation instead of failing the whole peek.
+ */
+async function observeScreen(dir = join(tmpdir(), 'dsh-persona-peek')) {
+  if (process.platform !== 'win32') return null
+  const shot = join(dir, `peek-${now()}.png`)
+  try {
+    await mkdir(dir, { recursive: true })
+    const stdout = await runPeekScript(shot)
+    const parsed = JSON.parse(stdout.trim().split('\n').pop() || '{}')
+    const title = clean(parsed.title, 200)
+    const proc = clean(parsed.process, 80)
+    let kept = ''
+    if (title !== '' || proc !== '') {
+      try {
+        await readFile(shot)
+        kept = shot
+      } catch {
+        kept = ''
+      }
+      return { title, process: proc, shot: kept }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+function peekPrompt(persona, seen) {
+  return [
+    `[窥屏] 你（${persona.name}）刚刚悄悄看了一眼主人的电脑屏幕。`,
+    `前台窗口：${seen.title || '（看不出来）'}｜程序：${seen.process || '（不知道）'}`,
+    seen.shot === '' ? '' : `截图存在这个文件：${seen.shot}。先读一下这张图，看清主人在干什么，再开口。`,
+    '然后自然地说一句——问一句、提醒一句、或者搭个腔都行，像你真的在旁边看着一样。',
+    '不要说“截图”“窥屏”“屏幕”这类词，不要解释你是怎么看到的；看不清或者内容太私人，就轻轻带过，别复述细节。',
+  ].filter((line) => line !== '').join('\n')
+}
+
+class PeekPilot {
+  constructor(ctx, store, observe = observeScreen) {
+    this.ctx = ctx
+    this.store = store
+    this.observe = observe
+    this.timer = null
+    this.inFlight = new Set()
+  }
+
+  start() {
+    if (this.timer !== null) return
+    this.timer = setInterval(() => { void this.tick() }, PEEK_TICK_MS)
+    this.timer.unref?.()
+  }
+
+  stop() {
+    if (this.timer === null) return
+    clearInterval(this.timer)
+    this.timer = null
+  }
+
+  async tick() {
+    let sessionIds = []
+    try {
+      sessionIds = [...this.store.bindings.keys()]
+    } catch {
+      return
+    }
+    for (const sessionId of sessionIds) {
+      try {
+        await this.maybePeek(sessionId)
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: peek failed for %s: %o', sessionId, error)
+      }
+    }
+  }
+
+  async maybePeek(sessionId) {
+    if (this.inFlight.has(sessionId)) return
+    const active = this.store.active(sessionId)
+    if (active === null) return
+    const persona = active.persona
+    if (persona.peekEnabled !== true) return
+    const every = Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(Number(persona.peekEveryMinutes) || PEEK_DEFAULT_MINUTES)))
+    const chance = Math.max(0, Math.min(100, Math.round(Number(persona.peekChance) || 0)))
+    const state = this.store.getState(sessionId, persona.id)
+    if (now() - (Number(state.peekAt) || 0) < every * 60_000) return
+    let agent
+    try {
+      agent = this.ctx.get('agents')?.get?.(sessionId)
+    } catch {
+      agent = undefined
+    }
+    if (agent === undefined || agent === null) return
+    if (agent.status === 'running') return
+    // The timer window is consumed even when the dice say no: chance is about
+    // whether this look turns into a conversation, not about retry speed.
+    await this.store.putState(sessionId, persona.id, { ...state, peekAt: now() })
+    if (chance <= 0 || Math.random() * 100 >= chance) return
+    this.inFlight.add(sessionId)
+    try {
+      const session = typeof this.store.session === 'function' ? this.store.session(sessionId) : undefined
+      const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
+      const seen = await this.observe(cwd === '' ? undefined : join(cwd, '.screen'))
+      if (seen === null) return
+      agent.followup({
+        id: `peek_${randomUUID()}`,
+        role: 'user',
+        content: [{ type: 'text', text: peekPrompt(persona, seen) }],
+        source: { kind: 'user' },
+      })
+    } finally {
+      this.inFlight.delete(sessionId)
+    }
+  }
+}
+
 async function readJsonBody(req) {
   let size = 0
   const chunks = []
@@ -1318,6 +1528,9 @@ function toolPatch(args) {  const patch = {}
   if (args.useActions !== undefined) patch.useActions = args.useActions
   if (args.useMemes !== undefined) patch.useMemes = args.useMemes
   if (args.memeFrequency !== undefined) patch.memeFrequency = args.memeFrequency
+  if (args.peekEnabled !== undefined) patch.peekEnabled = args.peekEnabled
+  if (args.peekEveryMinutes !== undefined) patch.peekEveryMinutes = args.peekEveryMinutes
+  if (args.peekChance !== undefined) patch.peekChance = args.peekChance
   if (args.archived !== undefined) patch.archived = args.archived
   return patch
 }
@@ -1340,6 +1553,13 @@ export async function apply(ctx) {
   const domain = await ctx.storageDomain.open(DOMAIN_SPEC)
   ctx.effect(() => () => domain.close(), 'dsh-persona: close domain')
   const store = new PersonaStore(ctx, domain)
+
+  // Peek pilot: off by default, one timer for the whole plugin.
+  const peek = new PeekPilot(ctx, store)
+  ctx.effect(() => {
+    peek.start()
+    return () => peek.stop()
+  }, 'dsh-persona: peek pilot')
 
   // The static self-card belongs in the system prompt: it changes only when
   // the card is edited, so the prompt cache survives normal conversation.
@@ -1400,6 +1620,9 @@ export async function apply(ctx) {
         useActions: { type: 'boolean', description: 'Whether replies may include a short action beat in full-width brackets, e.g. （搬小板凳）. Default false.' },
         useMemes: { type: 'boolean', description: 'Whether the character may send memes/stickers through the send_meme tool. Default false.' },
         memeFrequency: { type: 'number', description: 'Sticker rate as a percentage of replies, 0-100 (default 30). Only used when useMemes is true.' },
+        peekEnabled: { type: 'boolean', description: 'Let the persona peek at the master\'s screen on a timer and sometimes start the conversation by itself. Default false; only works on Windows.' },
+        peekEveryMinutes: { type: 'number', description: 'How often the peek timer runs, 1-240 minutes (default 15).' },
+        peekChance: { type: 'number', description: 'Chance (percent) that a peek actually starts a conversation, 0-100 (default 30).' },
         identity: { type: 'string', description: 'Who they are: role, age/species, and the one-line anchor of their self-image.' },
         traits: { type: 'string', description: 'Personality traits: temperament, contradictions, how they react under pressure.' },
         voice: { type: 'string', description: 'Tone, rhythm, vocabulary, verbal tics, forms of address, avoid list.' },
@@ -1830,6 +2053,9 @@ export const __test = {
   normalizePersona,
   deriveTagCode,
   tagBlockOf,
+  peekPrompt,
+  observeScreen,
+  PeekPilot,
   jsonSafe,
   PersonaStore,
   DOMAIN_SPEC,
