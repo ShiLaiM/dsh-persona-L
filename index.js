@@ -44,6 +44,7 @@ const MAX_REPLY_CHARS_DEFAULT = 0
 const TEXT_FIELDS = [
   'name',
   'summary',
+  'masterName',
   'tagCode',
   'identity',
   'traits',
@@ -62,6 +63,7 @@ const TEXT_FIELDS = [
 const FIELD_LIMITS = {
   name: 120,
   summary: 400,
+  masterName: 40,
   tagCode: 800,
   identity: 1400,
   traits: 900,
@@ -97,10 +99,24 @@ const SECTION_CAPS = {
   replyLength: { min: 150, max: 260 },
   actionBeats: { min: 160, max: 400 },
   memes: { min: 180, max: 500 },
+  masterName: { min: 60, max: 200 },
 }
 
 /** How often (as a share of replies) a card sends a sticker when memes are on. */
 const MEME_FREQUENCY_DEFAULT = 30
+
+/** Default way of addressing the person who bound the card. */
+const MASTER_NAME_DEFAULT = '主人'
+
+/**
+ * Custom form of address, stripped of quotes so it cannot break the sentence
+ * it is spliced into. '主人' is the default: it needs no instruction because
+ * every card already speaks that way.
+ */
+function masterNameOf(persona) {
+  const raw = clean(persona?.masterName, FIELD_LIMITS.masterName)
+  return raw.replace(/[「」『』"]/g, '').trim()
+}
 
 /** Action beats: short, visible, in full-width brackets — not narration. */
 const ACTION_BEATS_TEXT = [
@@ -217,6 +233,10 @@ function deriveTagCode(persona) {
   push('IDENTITY', persona.summary || persona.identity, 1, 32)
   push('PERSONALITY', persona.traits, 2, 30)
   push('TONE', persona.voice, 2, 26)
+  const masterName = masterNameOf(persona)
+  if (masterName !== '' && masterName !== MASTER_NAME_DEFAULT) {
+    push('CALL_MASTER', masterName, 1, 16)
+  }
   push('TO_MASTER', persona.relationship, 1, 30)
   push('TO_OTHERS', persona.relationshipOthers, 1, 30)
   push('BOUNDARY', persona.boundaries, 1, 28)
@@ -270,6 +290,7 @@ function normalizePersona(input, existing) {
         lore: '',
         tags: [],
         maxReplyChars: MAX_REPLY_CHARS_DEFAULT,
+        masterName: MASTER_NAME_DEFAULT,
         injectLore: true,
         injectTags: true,
         useActions: false,
@@ -283,6 +304,7 @@ function normalizePersona(input, existing) {
   for (const field of TEXT_FIELDS) {
     if (input[field] !== undefined) out[field] = clean(input[field], FIELD_LIMITS[field])
   }
+  out.masterName = masterNameOf(out) || MASTER_NAME_DEFAULT
   if (input.tags !== undefined) out.tags = cleanTags(input.tags)
   if (input.maxReplyChars !== undefined) {
     const raw = Number(input.maxReplyChars)
@@ -321,6 +343,7 @@ function summaryOf(persona) {
     traits: persona.traits ?? '',
     tags: Array.isArray(persona.tags) ? persona.tags : [],
     maxReplyChars: Number(persona.maxReplyChars) || 0,
+    masterName: masterNameOf(persona) || MASTER_NAME_DEFAULT,
     injectLore: persona.injectLore !== false,
     injectTags: persona.injectTags !== false,
     useActions: persona.useActions === true,
@@ -412,6 +435,17 @@ function compileCard(persona) {
   // can never eat the “master” instruction (and vice versa).
   const towardMaster = clean(persona.relationship, FIELD_LIMITS.relationship)
   const towardOthers = clean(persona.relationshipOthers, FIELD_LIMITS.relationshipOthers)
+  // A custom form of address is opt-in: '主人' is already how every card speaks.
+  const address = masterNameOf(persona)
+  if (address !== '' && address !== MASTER_NAME_DEFAULT) {
+    add(
+      'masterName',
+      'What to call your master',
+      `称呼固定：当面叫主人「${address}」，不要换成「用户」「对方」这类词；情绪重的时候也不换，除非主人自己要求改。`,
+      88,
+      107,
+    )
+  }
   if (towardMaster !== '' || towardOthers !== '') {
     add('relationshipNote', 'Who is in front of you', WHO_IS_WHO, 86, 105)
   }
@@ -637,6 +671,7 @@ function showPersonaText(persona, state) {
     `summary: ${persona.summary || '(empty)'}`,
     `tags: ${(persona.tags || []).join(', ') || '(none)'}`,
     `maxReplyChars: ${Number(persona.maxReplyChars) || 0}`,
+    `masterName: ${masterNameOf(persona) || MASTER_NAME_DEFAULT}`,
     `injectLore: ${persona.injectLore !== false}`,
     `injectTags: ${persona.injectTags !== false}`,
     `useActions: ${persona.useActions === true}`,
@@ -1359,6 +1394,7 @@ export async function apply(ctx) {
         id: { type: 'string', description: 'Persona id or exact name. Omit to address the active persona, except for use.' },
         name: { type: 'string', description: 'Display name. Required for create.' },
         summary: { type: 'string', description: 'One-line premise.' },
+        masterName: { type: 'string', description: 'What the character calls its master. Default 主人; set something else (哥哥 / 老板 / 爸爸) to pin a custom form of address — only the custom value is injected.' },
         tagCode: { type: 'string', description: 'Format-first anchor block in the viral 【PERSONA_LOAD】 register: the 【PERSONA_LOAD】 header followed by one uppercase TAG_value per line (SELF_CLAIM_x, IDENTITY_x, TO_MASTER_x, TO_OTHERS_x, BOUNDARY_x…), one anchor per line, no prose. Leave empty to derive it from the card automatically.' },
         injectTags: { type: 'boolean', description: 'Whether to inject the tag anchor block into the self-knowledge card. Default true.' },
         useActions: { type: 'boolean', description: 'Whether replies may include a short action beat in full-width brackets, e.g. （搬小板凳）. Default false.' },
