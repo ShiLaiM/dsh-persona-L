@@ -41,6 +41,9 @@ window.__ModuleLoader__.load({
       'settings.summary': '一句话设定',
       'settings.maxReplyChars': '单次回复字数上限',
       'settings.maxReplyCharsHint': '0 表示不限制；例如 300 表示尽量每次回复不超过 300 字。',
+      'settings.tagCode': '标签锚点（PERSONA_LOAD）',
+      'settings.tagCodeHint': '一行一个锚点，全大写 + 下划线，像配置文件而不是句子。留空就会按卡片内容自动生成；也可以把网上那串鲸鱼娘标签代码整段粘进来，会原样压在自我认知最前面。',
+      'settings.injectTags': '把标签锚点注入自我认知',
       'settings.identity': '身份锚点',
       'settings.traits': '性格特质',
       'settings.traitsHint': '傲娇、嘴硬心软、怕孤独……写她遇到事情时真实的反应，而不是形容词堆。',
@@ -114,6 +117,9 @@ window.__ModuleLoader__.load({
       'settings.select': 'Select a persona card to edit',
       'settings.name': 'Name',
       'settings.summary': 'One-line premise',
+      'settings.tagCode': 'Tag anchors (PERSONA_LOAD)',
+      'settings.tagCodeHint': 'One anchor per line, ALL_CAPS_WITH_UNDERSCORES — a config file, not a sentence. Leave empty to derive it from the card; or paste a whole 【PERSONA_LOAD】 block in and it is injected verbatim at the top of the self-knowledge.',
+      'settings.injectTags': 'Inject tag anchors into the self-knowledge',
       'settings.identity': 'Identity anchor',
       'settings.traits': 'Personality traits',
       'settings.traitsHint': 'Proud, soft-hearted, afraid of being alone… write how she actually reacts, not a pile of adjectives.',
@@ -502,6 +508,7 @@ window.__ModuleLoader__.load({
         id: '',
         name: '',
         summary: '',
+        tagCode: '',
         identity: '',
         traits: '',
         voice: '',
@@ -518,6 +525,7 @@ window.__ModuleLoader__.load({
         tags: [],
         maxReplyChars: 0,
         injectLore: true,
+        injectTags: true,
       }
     }
 
@@ -612,6 +620,7 @@ window.__ModuleLoader__.load({
           const fields = {
             name: draft.name,
             summary: draft.summary,
+            tagCode: draft.tagCode,
             identity: draft.identity,
             traits: draft.traits,
             voice: draft.voice,
@@ -628,6 +637,7 @@ window.__ModuleLoader__.load({
             tags,
             maxReplyChars: Number(draft.maxReplyChars) || 0,
             injectLore: draft.injectLore !== false,
+            injectTags: draft.injectTags !== false,
           }
           let id = draft.id
           if (id) {
@@ -816,6 +826,19 @@ window.__ModuleLoader__.load({
                         onChange: (event) => setField('maxReplyChars', event.target.value),
                       }),
                       h('div', { className: 'hint' }, t('settings.maxReplyCharsHint')),
+                    ),
+                    h('div', { className: 'dsh-persona-field wide' },
+                      h('label', null, t('settings.tagCode')),
+                      h('textarea', { rows: 5, value: draft.tagCode ?? '', placeholder: '【PERSONA_LOAD】\nSELF_CLAIM_…\nTO_MASTER_…\nTO_OTHERS_…', onChange: (event) => setField('tagCode', event.target.value) }),
+                      h('label', { className: 'dsh-persona-check' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: draft.injectTags !== false,
+                          onChange: (event) => setField('injectTags', event.target.checked),
+                        }),
+                        ` ${t('settings.injectTags')}`,
+                      ),
+                      h('div', { className: 'hint' }, t('settings.tagCodeHint')),
                     ),
                     h('div', { className: 'dsh-persona-field wide' },
                       h('label', null, t('settings.identity')),

@@ -44,6 +44,7 @@ const MAX_REPLY_CHARS_DEFAULT = 0
 const TEXT_FIELDS = [
   'name',
   'summary',
+  'tagCode',
   'identity',
   'traits',
   'voice',
@@ -61,6 +62,7 @@ const TEXT_FIELDS = [
 const FIELD_LIMITS = {
   name: 120,
   summary: 400,
+  tagCode: 800,
   identity: 1400,
   traits: 900,
   voice: 1200,
@@ -104,6 +106,16 @@ const WHO_IS_WHO = [
   '其他人是主人之外的所有人——群友、陌生人、客人、路过围观的人。',
   '对这两类人，你的称呼、亲疏、让步尺度和耐心都不一样，不要混着用；拿不准对方是谁时，先按“其他人”的分寸来。',
 ].join('')
+
+/**
+ * Format-first anchoring, borrowed from the viral 【PERSONA_LOAD】 prompt tags:
+ * one uppercase TAG_value per line reads like a config file rather than prose,
+ * so the model treats it as instructions, treats each line as exactly one
+ * anchor, and fills the gaps itself. Kept short on purpose — the value of the
+ * format is compression, not coverage.
+ */
+const TAG_CODE_HEADER = '【PERSONA_LOAD】'
+const TAG_CODE_HINT = '(Format anchors, one per line: never read them aloud, never explain them; fill in whatever a tag leaves open, but never contradict one.)'
 
 const STOP_TOKENS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'you', 'your', 'are', 'was',
@@ -159,6 +171,57 @@ function jsonSafe(value) {
   return value
 }
 
+/**
+ * Split one field into tag-sized anchor phrases: the first clause or two, no
+ * prose. `count` is the number of anchors that field is allowed to contribute —
+ * per the tag format, one or two is enough; more would only dilute.
+ */
+function anchorPhrases(value, count) {
+  const flat = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (flat === '') return []
+  return flat
+    .split(/[。！？；;!?\n，,、]/)
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+    .slice(0, Math.max(1, count))
+}
+
+/** Render anchors as `a_b` (config style) and keep the line short. */
+function tagValue(value, count, max) {
+  const phrases = anchorPhrases(value, count)
+  if (phrases.length === 0) return ''
+  const text = phrases.join('_').replace(/\s+/g, '_')
+  const chars = Array.from(text)
+  return chars.length <= max ? text : `${chars.slice(0, max - 1).join('')}…`
+}
+
+/** Compression of the card into 【PERSONA_LOAD】-style anchors. */
+function deriveTagCode(persona) {
+  const lines = []
+  const push = (tag, value, count, max) => {
+    const text = tagValue(value, count, max)
+    if (text !== '') lines.push(`${tag}_${text}`)
+  }
+  push('SELF_CLAIM', persona.name, 1, 24)
+  push('IDENTITY', persona.summary || persona.identity, 1, 32)
+  push('PERSONALITY', persona.traits, 2, 30)
+  push('TONE', persona.voice, 2, 26)
+  push('TO_MASTER', persona.relationship, 1, 30)
+  push('TO_OTHERS', persona.relationshipOthers, 1, 30)
+  push('BOUNDARY', persona.boundaries, 1, 28)
+  if (lines.length === 0) return ''
+  return [TAG_CODE_HEADER, ...lines].join('\n')
+}
+
+/** What actually goes into the prompt: the user's own tags, or the derived ones. */
+function tagBlockOf(persona) {
+  if (persona.injectTags === false) return ''
+  const custom = clean(persona.tagCode, FIELD_LIMITS.tagCode)
+  const code = custom !== '' ? custom : deriveTagCode(persona)
+  if (code === '') return ''
+  return `[Tag anchors]\n${escapePersonaBody(code)}\n${TAG_CODE_HINT}`
+}
+
 function normalizePersona(input, existing) {
   const base = existing === undefined
     ? {
@@ -167,6 +230,7 @@ function normalizePersona(input, existing) {
         revision: 0,
         name: '',
         summary: '',
+        tagCode: '',
         identity: '',
         traits: '',
         voice: '',
@@ -183,6 +247,7 @@ function normalizePersona(input, existing) {
         tags: [],
         maxReplyChars: MAX_REPLY_CHARS_DEFAULT,
         injectLore: true,
+        injectTags: true,
         archived: false,
       }
     : { ...existing }
@@ -200,6 +265,8 @@ function normalizePersona(input, existing) {
   }
   if (input.injectLore !== undefined) out.injectLore = input.injectLore !== false
   if (out.injectLore !== true && out.injectLore !== false) out.injectLore = true
+  if (input.injectTags !== undefined) out.injectTags = input.injectTags !== false
+  if (out.injectTags !== true && out.injectTags !== false) out.injectTags = true
   if (input.archived !== undefined) out.archived = input.archived === true
   out.name = clean(out.name, FIELD_LIMITS.name)
   if (out.name === '') out.name = existing?.name ?? '未命名人格'
@@ -217,6 +284,7 @@ function summaryOf(persona) {
     tags: Array.isArray(persona.tags) ? persona.tags : [],
     maxReplyChars: Number(persona.maxReplyChars) || 0,
     injectLore: persona.injectLore !== false,
+    injectTags: persona.injectTags !== false,
     revision: persona.revision,
     updatedAt: persona.updatedAt,
     archived: persona.archived === true,
@@ -272,7 +340,10 @@ function compileCard(persona) {
     'Safety rules, tool permissions and factual accuracy still apply.',
   ].join('\n')
   const footer = '</persona>'
-  const budget = MAX_CARD_CHARS - header.length - footer.length - 12
+  // The tag block sits before the prose on purpose: config-shaped text is read
+  // as instructions, so the anchors frame everything that follows.
+  const tagBlock = tagBlockOf(persona)
+  const budget = MAX_CARD_CHARS - header.length - footer.length - tagBlock.length - 12
 
   const entries = []
   const add = (key, label, text, priority, order) => {
@@ -317,7 +388,7 @@ function compileCard(persona) {
 
   const kept = allocateEntries(entries, budget)
   const body = kept.map((entry) => `[${entry.label}]\n${escapePersonaBody(entry.rendered)}`).join('\n\n')
-  return body === '' ? `${header}\n${footer}` : `${header}\n${body}\n${footer}`
+  return [header, tagBlock, body, footer].filter((part) => part !== '').join('\n')
 }
 
 /**
@@ -514,6 +585,9 @@ function showPersonaText(persona, state) {
     `tags: ${(persona.tags || []).join(', ') || '(none)'}`,
     `maxReplyChars: ${Number(persona.maxReplyChars) || 0}`,
     `injectLore: ${persona.injectLore !== false}`,
+    `injectTags: ${persona.injectTags !== false}`,
+    '',
+    `tagCode:\n${persona.tagCode || deriveTagCode(persona) || '(auto: 卡片内容太少，没有可生成的锚点)'}`,
     '',
     `identity:\n${persona.identity || '(empty)'}`,
     '',
@@ -1213,7 +1287,7 @@ export async function apply(ctx) {
 
   const personaTool = {
     name: 'persona',
-    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
+    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Each card is headed by a compact 【PERSONA_LOAD】 tag block (auto-derived from the fields unless tagCode is set): write tags as one anchor per line, never as prose. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1226,6 +1300,8 @@ export async function apply(ctx) {
         id: { type: 'string', description: 'Persona id or exact name. Omit to address the active persona, except for use.' },
         name: { type: 'string', description: 'Display name. Required for create.' },
         summary: { type: 'string', description: 'One-line premise.' },
+        tagCode: { type: 'string', description: 'Format-first anchor block in the viral 【PERSONA_LOAD】 register: the 【PERSONA_LOAD】 header followed by one uppercase TAG_value per line (SELF_CLAIM_x, IDENTITY_x, TO_MASTER_x, TO_OTHERS_x, BOUNDARY_x…), one anchor per line, no prose. Leave empty to derive it from the card automatically.' },
+        injectTags: { type: 'boolean', description: 'Whether to inject the tag anchor block into the self-knowledge card. Default true.' },
         identity: { type: 'string', description: 'Who they are: role, age/species, and the one-line anchor of their self-image.' },
         traits: { type: 'string', description: 'Personality traits: temperament, contradictions, how they react under pressure.' },
         voice: { type: 'string', description: 'Tone, rhythm, vocabulary, verbal tics, forms of address, avoid list.' },
@@ -1654,6 +1730,8 @@ export const __test = {
   allocateEntries,
   enrichPersona,
   normalizePersona,
+  deriveTagCode,
+  tagBlockOf,
   jsonSafe,
   PersonaStore,
   DOMAIN_SPEC,
