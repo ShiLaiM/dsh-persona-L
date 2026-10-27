@@ -1315,6 +1315,20 @@ class PeekPilot {
     }
   }
 
+  /** 归档的会话不主动叫醒：工作区注册表里有归档 id 列表。 */
+  isArchived(sessionId) {
+    let registry
+    try {
+      registry = this.ctx.get('workspaceRegistry')
+    } catch {
+      registry = undefined
+    }
+    const ids = registry?.archivedSessionIds
+    if (!Array.isArray(ids)) return false
+    const wanted = String(sessionId)
+    return ids.some((id) => String(id) === wanted)
+  }
+
   /** GUI 打开的 agent 优先，其次是我们自己 resume 出来的。 */
   agentFor(sessionId) {
     let live
@@ -1389,6 +1403,8 @@ class PeekPilot {
 
   async maybePeek(sessionId) {
     if (this.inFlight.has(sessionId)) return
+    // 归档会话不主动叫醒：不占计时窗口、不截屏、不注入。
+    if (this.isArchived(sessionId)) return
     const active = this.store.active(sessionId)
     if (active === null) return
     const persona = active.persona
