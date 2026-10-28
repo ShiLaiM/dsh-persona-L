@@ -122,6 +122,16 @@ window.__ModuleLoader__.load({
       'boundary.reload': '刷新页面',
       'boundary.note': '重试只是清掉错误、按当前数据再画一次。如果一进来还是这个报错，说明是数据有问题，把上面的文字带过来。',
       'boundary.dockTitle': '人格按钮出错了',
+      'dock.nextPurpose': '目的',
+      'dock.nextPeek': '窥屏',
+      'dock.nextPending': '待排程',
+      'dock.nextSoon': '即将',
+      'dock.nextReady': '随时',
+      'dock.nextPurposeTitle': '目的机制：预计 {time} 开口（还有 {left}）。安静时段、高峰和每日上限都会让它顺延。',
+      'dock.nextDueTitle': '目的机制：{time} 已到点，正在等下一次判定；可能被高峰、安静时段或次数上限挡住。',
+      'dock.nextPendingTitle': '目的机制刚开启，还没排出下一次；一般 30 分钟内会有第一轮。',
+      'dock.nextPeekTitle': '窥屏：每 {every} 分钟检查一次，下次检查还有 {left}。到点后只有 {chance}% 概率会开口。',
+      'dock.nextPeekReadyTitle': '窥屏：现在就可以检查了，到点后 {chance}% 概率会开口。',
       'settings.peekSection': '窥屏',
       'settings.peekOffTag': '（已停用）',
       'settings.purposeSection': '目的机制',
@@ -145,6 +155,11 @@ window.__ModuleLoader__.load({
       'settings.tabPreview': '预览',
       'settings.memSearch': '搜索记忆…',
       'settings.memKindAll': '全部类型',
+      'settings.memDigest': '归纳一下',
+      'settings.memDigestHint': '读这张卡最近有对话的那个会话，让模型写出稳定规律（比如「常年熬夜，劝睡很少照做」），不会写事件流水账。',
+      'settings.memDigestDone': '归纳完成，新增',
+      'settings.memDigestEmpty': '这段对话里没看出足够稳的规律，这次没加新条目。',
+      'settings.memoryDigestTag': '归纳',
       'settings.memOwnerAll': '全部来源',
       'settings.memSortClarity': '按鲜活度',
       'settings.memSortImportance': '按重要度',
@@ -314,6 +329,16 @@ window.__ModuleLoader__.load({
       'boundary.reload': 'Reload page',
       'boundary.note': 'Retry just clears the error and redraws with the current data. If it comes right back, the data is the problem — send me the text above.',
       'boundary.dockTitle': 'Persona buttons failed',
+      'dock.nextPurpose': 'Purpose',
+      'dock.nextPeek': 'Peek',
+      'dock.nextPending': 'unscheduled',
+      'dock.nextSoon': 'due',
+      'dock.nextReady': 'ready',
+      'dock.nextPurposeTitle': 'Purpose: expected around {time} ({left} from now). Quiet hours, the busy band and the daily cap can push it back.',
+      'dock.nextDueTitle': 'Purpose: {time} has passed and it is waiting for the next check; busy hours, quiet hours or the daily cap may be holding it back.',
+      'dock.nextPendingTitle': 'Purpose was just switched on and has not scheduled anything yet; the first round usually lands within 30 minutes.',
+      'dock.nextPeekTitle': 'Peek: checks every {every} minutes, next check in {left}. Even then it only speaks {chance}% of the time.',
+      'dock.nextPeekReadyTitle': 'Peek: ready to check now; it speaks {chance}% of the time.',
       'settings.peekSection': 'Peek',
       'settings.peekOffTag': ' (off)',
       'settings.purposeSection': 'Purpose',
@@ -337,6 +362,11 @@ window.__ModuleLoader__.load({
       'settings.tabPreview': 'Preview',
       'settings.memSearch': 'Search memories…',
       'settings.memKindAll': 'All kinds',
+      'settings.memDigest': 'Summarise',
+      'settings.memDigestHint': 'Reads the most recent session bound to this card and asks the model for stable patterns (e.g. "stays up late; being told to sleep rarely works"), not a replay of events.',
+      'settings.memDigestDone': 'Summarised, added',
+      'settings.memDigestEmpty': 'Nothing stable enough stood out this time; no new entries.',
+      'settings.memoryDigestTag': 'summarised',
       'settings.memOwnerAll': 'All sources',
       'settings.memSortClarity': 'By clarity',
       'settings.memSortImportance': 'By importance',
@@ -577,6 +607,83 @@ window.__ModuleLoader__.load({
       return data
     }
 
+    /** 倒计时文案：N 分 / N 小时 M 分。 */
+    function formatCountdown(ms) {
+      if (!Number.isFinite(ms) || ms <= 0) return ''
+      const totalMin = Math.ceil(ms / 60_000)
+      if (totalMin < 1) return '1 分'
+      if (totalMin < 60) return `${totalMin} 分`
+      const hours = Math.floor(totalMin / 60)
+      const mins = totalMin % 60
+      return mins === 0 ? `${hours} 小时` : `${hours} 小时 ${mins} 分`
+    }
+
+    function fillTemplate(template, values) {
+      let out = String(template ?? '')
+      for (const [key, value] of Object.entries(values)) {
+        out = out.split(`{${key}}`).join(String(value))
+      }
+      return out
+    }
+
+    function clockOf(at) {
+      const date = new Date(at)
+      return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+    }
+
+    /**
+     * 收起那排的倒计时：目的开着就只看目的（那时窥屏是停用的），否则看窥屏。
+     * 窥屏只能预告「下次可以检查」——到点还要掷骰子，title 里必须写清楚这一点。
+     */
+    function dockSchedule(active, nowMs, t) {
+      if (active === null || active === undefined) return null
+      const persona = active.persona ?? {}
+      const state = active.state ?? {}
+      if (persona.purposeEnabled === true) {
+        const nextAt = Number(state.purposeNextAt) || 0
+        if (nextAt <= 0) {
+          return { kind: 'purpose', label: t('dock.nextPending'), title: t('dock.nextPendingTitle'), overdue: false }
+        }
+        const left = nextAt - nowMs
+        if (left <= 0) {
+          return {
+            kind: 'purpose',
+            label: t('dock.nextSoon'),
+            title: fillTemplate(t('dock.nextDueTitle'), { time: clockOf(nextAt) }),
+            overdue: true,
+          }
+        }
+        return {
+          kind: 'purpose',
+          label: formatCountdown(left),
+          title: fillTemplate(t('dock.nextPurposeTitle'), { time: clockOf(nextAt), left: formatCountdown(left) }),
+          overdue: false,
+        }
+      }
+      const peek = active.peek
+      if (peek === undefined || peek === null || peek.effective !== true) return null
+      const every = Number(peek.profile?.everyMinutes) || 0
+      if (every <= 0) return null
+      const chance = Number(peek.profile?.chance) || 0
+      const lastAt = Number(state.peekAt) || 0
+      const dueAt = lastAt <= 0 ? nowMs : lastAt + every * 60_000
+      const left = dueAt - nowMs
+      if (left <= 0) {
+        return {
+          kind: 'peek',
+          label: t('dock.nextReady'),
+          title: fillTemplate(t('dock.nextPeekReadyTitle'), { chance }),
+          overdue: true,
+        }
+      }
+      return {
+        kind: 'peek',
+        label: formatCountdown(left),
+        title: fillTemplate(t('dock.nextPeekTitle'), { every, left: formatCountdown(left), chance }),
+        overdue: false,
+      }
+    }
+
     function PersonaDock(props) {
       // This plugin's operation UI is intentionally Chinese. The locale
       // dictionaries below still keep an English copy for future use.
@@ -588,6 +695,14 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [error, setError] = useState('')
       const [showSelf, setShowSelf] = useState(false)
+      // 倒计时靠本地时钟走：每 10 秒重算一次文案，不为此打后端。
+      const [tickAt, setTickAt] = useState(() => Date.now())
+      const scheduleFetchAt = useRef(0)
+
+      useEffect(() => {
+        const timer = setInterval(() => setTickAt(Date.now()), 10_000)
+        return () => clearInterval(timer)
+      }, [])
 
       /** 跳到左侧栏那个一级页面；拿不到布局服务就提示走图标。 */
       const openFullPanel = () => {
@@ -633,6 +748,16 @@ window.__ModuleLoader__.load({
 
       const active = snapshot?.active ?? null
       const personas = snapshot?.personas ?? []
+      const schedule = dockSchedule(active, tickAt, t)
+
+      // 倒计时走完了就重新拉一次，否则会一直停在「随时/即将」。
+      // 最多每分钟一问，别让已经触发过的会话被反复轮询。
+      useEffect(() => {
+        if (schedule === null || schedule.overdue !== true) return
+        if (tickAt - scheduleFetchAt.current < 60_000) return
+        scheduleFetchAt.current = tickAt
+        void load()
+      }, [schedule?.overdue, tickAt, load])
       const filtered = useMemo(() => {
         const needle = query.trim().toLowerCase()
         if (needle === '') return personas
@@ -739,6 +864,14 @@ window.__ModuleLoader__.load({
                 disabled: busy || active.persona?.purposeEnabled === true,
                 onClick: () => { void setPeek(active.peek?.effective === true ? false : true) },
               }, active.persona?.purposeEnabled === true ? t('dock.peekTaken') : t('dock.peek'))
+            : null,
+          // 倒计时紧挨着窥屏按钮：只显示当前真正在跑的那个机制。
+          schedule !== null
+            ? h('span', {
+                className: 'dsh-persona-peeklast',
+                title: schedule.title,
+                'aria-label': schedule.title,
+              }, `${schedule.kind === 'purpose' ? t('dock.nextPurpose') : t('dock.nextPeek')} ${schedule.label}`)
             : null,
           active
             ? h('button', {
@@ -1117,6 +1250,8 @@ window.__ModuleLoader__.load({
               `${t('settings.memoryClarity')} ${Math.round((item.clarity ?? 1) * 100)}%`,
               item.mergedCount > 1 ? `${t('settings.memoryMerged')} ${item.mergedCount}` : '',
               item.source === 'auto' ? t('settings.memoryAuto') : '',
+              // 归纳出来的结论要能一眼认出来：它会影响行为，也最该被复核。
+              item.kind === 'pattern' || item.source === 'digest' ? t('settings.memoryDigestTag') : '',
               item.owner || '',
               item.firstMet ? t('settings.memoryFirstMet') : '',
             ].filter(Boolean).join(' · '),
@@ -1342,6 +1477,26 @@ window.__ModuleLoader__.load({
           }))
           await loadList()
           await loadPreview(draft.id)
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      // 归纳：读这张卡最近有对话的那个会话，让模型写出「规律」而不是事件。
+      const digestNow = async () => {
+        if (draft?.id === undefined || draft.id === '') return
+        setBusy(true)
+        setError('')
+        setStatus('')
+        try {
+          const data = await api('memory-digest', { id: draft.id })
+          const added = Array.isArray(data.added) ? data.added : []
+          await loadMemories(draft.id)
+          setStatus(added.length === 0
+            ? t('settings.memDigestEmpty')
+            : `${t('settings.memDigestDone')} ${added.length} 条`)
         } catch (cause) {
           setError(cause instanceof Error ? cause.message : String(cause))
         } finally {
@@ -1889,6 +2044,7 @@ window.__ModuleLoader__.load({
                         h('option', { value: 'preference' }, '偏好'),
                         h('option', { value: 'plan' }, '计划'),
                         h('option', { value: 'event' }, '事件'),
+                        h('option', { value: 'pattern' }, '归纳'),
                       ),
                       h('select', { value: memOwner, onChange: (event) => setMemOwner(event.target.value) },
                         h('option', { value: '' }, t('settings.memOwnerAll')),
@@ -1912,6 +2068,13 @@ window.__ModuleLoader__.load({
                         : group.items.map((item) => renderMemoryRow(item)),
                     )),
                     h('div', { className: 'dsh-persona-memtools' },
+                      h('button', {
+                        type: 'button',
+                        className: 'dsh-persona-btn',
+                        disabled: busy,
+                        title: t('settings.memDigestHint'),
+                        onClick: () => { void digestNow() },
+                      }, t('settings.memDigest')),
                       h('button', {
                         type: 'button',
                         className: 'dsh-persona-btn',
