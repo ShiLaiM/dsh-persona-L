@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const API = '/dsh-persona/api'
 
     /** 宿主服务句柄：apply 时尽量抓一下，抓不到就走图标入口。 */
-    const RUNTIME = { layout: null }
+    const RUNTIME = { layout: null, t: (key) => key }
 
     /** 与宿主同一套解析：把「09:00-12:00, 14:00-18:00」变成当天分钟区间（跨夜拆两段）。 */
     function clientBusyRanges(raw) {
@@ -113,10 +113,18 @@ window.__ModuleLoader__.load({
       'settings.purposeDailyMaxHint': '按卡算，跨会话共享；0 表示不主动，上限 24。',
       'settings.purposeRunOnBusy': '高峰时段也开口',
       'settings.purposeRunOnBusyHint': '默认高峰整段闭嘴；勾上就按正常间隔走，忙的时候也会找你说事。',
+      'settings.purposeGap': '两次开口的间隔',
+      'settings.purposeGapUnit': '分钟',
+      'settings.purposeGapHint': '从上次真正开口算起，随机落在这个区间。撞上高峰或安静时段只会顺延到边界，不会重新从头累计。',
+      'boundary.title': '人格页这块渲染出错了',
+      'boundary.hint': '插件本身还在运行，只是这一块崩了。下面的报错可以直接贴给我。',
+      'boundary.retry': '重试渲染',
+      'boundary.reload': '刷新页面',
+      'boundary.note': '重试只是清掉错误、按当前数据再画一次。如果一进来还是这个报错，说明是数据有问题，把上面的文字带过来。',
       'settings.peekSection': '窥屏',
       'settings.peekOffTag': '（已停用）',
       'settings.purposeSection': '目的机制',
-      'settings.purposeHint': '跟窥屏不一样：窥屏是定时看一眼、按概率开口；这个是到点先看有没有值得说的事，没有就不出声。自带安静时段 23:30–08:30、一天最多 4 次（按卡算，跨会话共享）、你刚说完话 30 分钟内不插嘴，窥屏分档里设的高峰时段整段不开口。开着的时候窥屏整个停用。',
+      'settings.purposeHint': '跟窥屏不一样：窥屏是定时看一眼、按概率开口；这个是到点先看有没有值得说的事，没有就不出声。自带安静时段 23:30–08:30，一天最多几次和两次之间的间隔都在上面可调，你刚说完话 30 分钟内不插嘴；窥屏分档里设的高峰时段默认整段不开口，勾了「高峰时段也开口」才会跑。开着的时候窥屏整个停用。',
       'settings.memoriesHint': '跟着这张卡走，跨会话还在。会随时间变淡（鲜活度），但不会自动消失；置顶和初遇永不衰减。',
       'settings.memoryPlaceholder': '记一件值得记住的事…',
       'settings.memoryAdd': '记下',
@@ -128,6 +136,9 @@ window.__ModuleLoader__.load({
       'settings.memoryClarity': '鲜活',
       'settings.memoryFirstMet': '初遇',
       'settings.memoryMerged': '合并',
+      'settings.memoryAuto': '自动记的',
+      'settings.autoMemory': '自动记忆：从我说的话里记事实和偏好',
+      'settings.autoMemoryHint': '默认关。开着时我会在对话里自己判断：你说到关于自己的事、明确偏好、没兑现的约定，就记一条；任务细节和临时状态不记。一轮最多一条。',
       'settings.tabSettings': '设定',
       'settings.tabMemory': '记忆',
       'settings.tabPreview': '预览',
@@ -293,10 +304,18 @@ window.__ModuleLoader__.load({
       'settings.purposeDailyMaxHint': 'Counted per card across sessions; 0 means never, capped at 24.',
       'settings.purposeRunOnBusy': 'Also speak during busy hours',
       'settings.purposeRunOnBusyHint': 'By default it stays silent through the busy band; tick this to keep the normal pace there too.',
+      'settings.purposeGap': 'Interval between messages',
+      'settings.purposeGapUnit': 'min',
+      'settings.purposeGapHint': 'Counted from the last message it actually sent, picked at random inside this range. Hitting busy or quiet hours only pushes it to the boundary; the countdown does not restart.',
+      'boundary.title': 'This part of the persona page failed to render',
+      'boundary.hint': 'The plugin itself is still running; only this view crashed. The error below is safe to copy back to me.',
+      'boundary.retry': 'Retry render',
+      'boundary.reload': 'Reload page',
+      'boundary.note': 'Retry just clears the error and redraws with the current data. If it comes right back, the data is the problem — send me the text above.',
       'settings.peekSection': 'Peek',
       'settings.peekOffTag': ' (off)',
       'settings.purposeSection': 'Purpose',
-      'settings.purposeHint': 'Different from peek: peek looks on a timer and speaks by chance; this one first checks whether anything is actually worth saying, and stays quiet otherwise. Quiet hours 23:30-08:30, at most 4 times a day (counted per card, shared across sessions), it backs off for 30 minutes after you speak, and it stays silent through the busy band you configured for peek. While on, peek is disabled entirely.',
+      'settings.purposeHint': 'Different from peek: peek looks on a timer and speaks by chance; this one first checks whether anything is actually worth saying, and stays quiet otherwise. Quiet hours 23:30-08:30; the daily cap and the interval between messages are both adjustable above; it backs off for 30 minutes after you speak; the busy band you configured for peek stays silent unless "Also speak during busy hours" is ticked. While on, peek is disabled entirely.',
       'settings.memoriesHint': 'They travel with this card across sessions. They fade over time (clarity) but are never dropped automatically; pinned items and the first meeting never fade.',
       'settings.memoryPlaceholder': 'One thing worth keeping…',
       'settings.memoryAdd': 'Keep it',
@@ -308,6 +327,9 @@ window.__ModuleLoader__.load({
       'settings.memoryClarity': 'clarity',
       'settings.memoryFirstMet': 'first met',
       'settings.memoryMerged': 'merged',
+      'settings.memoryAuto': 'auto',
+      'settings.autoMemory': 'Auto memory: pick up facts and preferences from what I say',
+      'settings.autoMemoryHint': 'Off by default. When on, the model decides during the conversation: mention something about yourself, a clear preference, or an unkept promise, and it keeps one line. Task details and transient state are skipped, at most one per turn.',
       'settings.tabSettings': 'Settings',
       'settings.tabMemory': 'Memory',
       'settings.tabPreview': 'Preview',
@@ -922,6 +944,9 @@ window.__ModuleLoader__.load({
         purposeEnabled: false,
         purposeDailyMax: 4,
         purposeRunOnBusy: false,
+        purposeMinGapMinutes: 60,
+        purposeMaxGapMinutes: 120,
+        autoMemory: false,
       }
     }
 
@@ -1089,6 +1114,7 @@ window.__ModuleLoader__.load({
               `${t('settings.memoryImportance')} ${item.importance}`,
               `${t('settings.memoryClarity')} ${Math.round((item.clarity ?? 1) * 100)}%`,
               item.mergedCount > 1 ? `${t('settings.memoryMerged')} ${item.mergedCount}` : '',
+              item.source === 'auto' ? t('settings.memoryAuto') : '',
               item.owner || '',
               item.firstMet ? t('settings.memoryFirstMet') : '',
             ].filter(Boolean).join(' · '),
@@ -1112,15 +1138,17 @@ window.__ModuleLoader__.load({
         }, '×'),
       )
 
+      // 数字框留空就回默认值，不要因为空串被当成 0（0 是「这一档不看」）。
+      // 放在组件作用域：save / commitGap / 将来的数字框都能用。
+      const num = (value, fallback) => {
+        const raw = String(value ?? '').trim()
+        if (raw === '') return fallback
+        const parsed = Number(raw)
+        return Number.isFinite(parsed) ? parsed : fallback
+      }
+
       const save = async () => {
         if (draft === null) return
-        // 数字框留空就回默认值，不要因为空串被当成 0（0 是「这一档不看」）。
-        const num = (value, fallback) => {
-          const raw = String(value ?? '').trim()
-          if (raw === '') return fallback
-          const parsed = Number(raw)
-          return Number.isFinite(parsed) ? parsed : fallback
-        }
         if (String(draft.name ?? '').trim() === '') {
           setError(t('settings.nameRequired'))
           return
@@ -1163,6 +1191,13 @@ window.__ModuleLoader__.load({
             peekBusyEveryMinutes: num(draft.peekBusyEveryMinutes, 5),
             peekBusyChance: num(draft.peekBusyChance, 60),
             purposeEnabled: draft.purposeEnabled === true,
+            // 下面五个必须一起带上：漏掉任何一项，点保存时后端会拿库里的旧值把它们盖回去，
+            // 表现就是「改完没变、按保存反而弹回原值」。
+            purposeDailyMax: num(draft.purposeDailyMax, 4),
+            purposeRunOnBusy: draft.purposeRunOnBusy === true,
+            purposeMinGapMinutes: num(draft.purposeMinGapMinutes, 60),
+            purposeMaxGapMinutes: num(draft.purposeMaxGapMinutes, 120),
+            autoMemory: draft.autoMemory === true,
           }
           let id = draft.id
           if (id) {
@@ -1266,6 +1301,43 @@ window.__ModuleLoader__.load({
           const data = await api('update', { id: draft.id, patch: { [field]: value } })
           // 只同步 revision，不拿返回值覆盖 draft——否则会把还没保存的文字改动冲掉。
           setDraft((prev) => (prev === null ? prev : { ...prev, revision: data.persona?.revision ?? prev.revision }))
+          await loadList()
+          await loadPreview(draft.id)
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      // 间隔上下限一起提交：min 超过 max 时在本地先扶正，回填也用本地算好的值。
+      // 注意：不要在这里调 save() 里的 num——那是局部函数，在这里不可见，
+      // 抛错会发生在 setDraft 的更新回调里，try/catch 接不住，整页白屏。
+      const commitGap = async () => {
+        const rawMin = Number(draft?.purposeMinGapMinutes === '' || draft?.purposeMinGapMinutes === undefined || draft?.purposeMinGapMinutes === null
+          ? 60
+          : draft.purposeMinGapMinutes)
+        const rawMax = Number(draft?.purposeMaxGapMinutes === '' || draft?.purposeMaxGapMinutes === undefined || draft?.purposeMaxGapMinutes === null
+          ? 120
+          : draft.purposeMaxGapMinutes)
+        const min = Number.isFinite(rawMin) ? Math.max(5, Math.min(1440, Math.round(rawMin))) : 60
+        const max = Number.isFinite(rawMax) ? Math.max(min, Math.min(1440, Math.round(rawMax))) : Math.max(min, 120)
+        setField('purposeMinGapMinutes', min)
+        setField('purposeMaxGapMinutes', max)
+        if (draft?.id === undefined || draft.id === '') return
+        setBusy(true)
+        setError('')
+        try {
+          const data = await api('update', {
+            id: draft.id,
+            patch: { purposeMinGapMinutes: min, purposeMaxGapMinutes: max },
+          })
+          setDraft((prev) => (prev === null ? prev : {
+            ...prev,
+            revision: data.persona?.revision ?? prev.revision,
+            purposeMinGapMinutes: min,
+            purposeMaxGapMinutes: max,
+          }))
           await loadList()
           await loadPreview(draft.id)
         } catch (cause) {
@@ -1562,10 +1634,51 @@ window.__ModuleLoader__.load({
                         min: 0,
                         max: 24,
                         step: 1,
-                        value: draft.purposeDailyMax ?? 4,
+                        // 统一成字符串，避免 number/string 在受控输入里来回切换导致光标或值跳动
+                        value: draft.purposeDailyMax === undefined || draft.purposeDailyMax === null
+                          ? ''
+                          : String(draft.purposeDailyMax),
                         onChange: (event) => setField('purposeDailyMax', event.target.value),
+                        // 失焦即落库：这个框不用再点「保存」
+                        onBlur: () => {
+                          const raw = draft.purposeDailyMax
+                          const parsed = Number(raw === '' || raw === undefined || raw === null ? 4 : raw)
+                          void toggleNow('purposeDailyMax', Number.isFinite(parsed) ? parsed : 4)
+                        },
                       }),
                       h('div', { className: 'hint' }, t('settings.purposeDailyMaxHint')),
+                      h('label', null, t('settings.purposeGap')),
+                      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                        h('input', {
+                          type: 'number',
+                          min: 5,
+                          max: 1440,
+                          step: 5,
+                          'aria-label': t('settings.purposeGap') + ' min',
+                          style: { width: '110px' },
+                          value: draft.purposeMinGapMinutes === undefined || draft.purposeMinGapMinutes === null
+                            ? ''
+                            : String(draft.purposeMinGapMinutes),
+                          onChange: (event) => setField('purposeMinGapMinutes', event.target.value),
+                          onBlur: () => { void commitGap() },
+                        }),
+                        h('span', { className: 'hint' }, '–'),
+                        h('input', {
+                          type: 'number',
+                          min: 5,
+                          max: 1440,
+                          step: 5,
+                          'aria-label': t('settings.purposeGap') + ' max',
+                          style: { width: '110px' },
+                          value: draft.purposeMaxGapMinutes === undefined || draft.purposeMaxGapMinutes === null
+                            ? ''
+                            : String(draft.purposeMaxGapMinutes),
+                          onChange: (event) => setField('purposeMaxGapMinutes', event.target.value),
+                          onBlur: () => { void commitGap() },
+                        }),
+                        h('span', { className: 'hint' }, t('settings.purposeGapUnit')),
+                      ),
+                      h('div', { className: 'hint' }, t('settings.purposeGapHint')),
                       h('label', { className: 'dsh-persona-check' },
                         h('input', {
                           type: 'checkbox',
@@ -1750,6 +1863,17 @@ window.__ModuleLoader__.load({
                   ),
                   ),
                   h('div', { style: tab === 'memory' ? undefined : { display: 'none' } },
+                    h('div', { className: 'dsh-persona-field wide', style: { marginBottom: 6 } },
+                      h('label', { className: 'dsh-persona-check' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: draft.autoMemory === true,
+                          onChange: (event) => { void toggleNow('autoMemory', event.target.checked) },
+                        }),
+                        ` ${t('settings.autoMemory')}`,
+                      ),
+                      h('div', { className: 'hint' }, t('settings.autoMemoryHint')),
+                    ),
                     h('div', { className: 'dsh-persona-memtools' },
                       h('input', {
                         className: 'dsh-persona-memsearch',
@@ -1893,12 +2017,73 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 渲染兜底：人格页任何一处抛错都只崩这一块，不把整个界面刷成白的。
+     * 必须是 class —— 函数组件做不了错误边界（getDerivedStateFromError）。
+     */
+    class PersonaBoundary extends React.Component {
+      constructor(props) {
+        super(props)
+        this.state = { error: null, at: 0 }
+        this.retry = this.retry.bind(this)
+        this.reload = this.reload.bind(this)
+      }
+
+      static getDerivedStateFromError(error) {
+        return { error }
+      }
+
+      componentDidCatch(error, info) {
+        // 留现场：控制台里能看到完整堆栈和组件栈，方便直接贴回来。
+        try {
+          console.error('[dsh-persona] 人格页渲染出错：', error, info?.componentStack ?? '')
+        } catch {}
+      }
+
+      retry() {
+        this.setState({ error: null, at: Date.now() })
+      }
+
+      reload() {
+        try { window.location.reload() } catch {}
+      }
+
+      render() {
+        const error = this.state.error
+        if (error === null || error === undefined) return this.props?.children ?? null
+        const message = error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error)
+        return h('div', { className: 'dsh-persona-field', style: { padding: '16px' } },
+          h('div', { style: { fontWeight: 600, marginBottom: '6px' } }, RUNTIME.t('boundary.title')),
+          h('div', { className: 'hint' }, RUNTIME.t('boundary.hint')),
+          h('pre', {
+            style: {
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+              fontSize: '12px',
+              lineHeight: 1.5,
+              padding: '10px',
+              marginTop: '10px',
+              borderRadius: '6px',
+              background: 'rgba(127,127,127,0.12)',
+            },
+          }, message),
+          h('div', { style: { display: 'flex', gap: '8px', marginTop: '12px' } },
+            h('button', { type: 'button', onClick: this.retry }, RUNTIME.t('boundary.retry')),
+            h('button', { type: 'button', onClick: this.reload }, RUNTIME.t('boundary.reload')),
+          ),
+          h('div', { className: 'hint', style: { marginTop: '8px' } }, RUNTIME.t('boundary.note')),
+        )
+      }
+    }
+
     /** 一级页面：复用设置页那套编辑器，外面套一层限宽容器。 */
     function PersonaPage() {
       return h('div', { className: 'dsh-persona-page' },
         h(Style),
         h('div', { className: 'dsh-persona-page-inner' },
-          h(PersonaSettings, null),
+          h(PersonaBoundary, null, h(PersonaSettings, null)),
         ),
       )
     }
@@ -1911,6 +2096,8 @@ window.__ModuleLoader__.load({
           'dsh-persona: locale dictionaries',
         )
         const t = (key) => ZH[key] ?? key
+        // 兜底视图也要能说人话：把 t 挂到 RUNTIME，PersonaBoundary 里用。
+        RUNTIME.t = t
 
         // 拿宿主布局服务：用来从 dock 跳到侧栏的人格页。拿不到就退回图标入口。
         try {

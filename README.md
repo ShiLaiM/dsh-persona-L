@@ -228,8 +228,16 @@ dsh plugin add github:ShiLaiM/dsh-persona-L
 
 ## 生效
 
-- 改了 `index.js`（宿主半边）后，重启一次 DSH 才会加载新代码。
+- 改了 `index.js`（宿主半边）后，重启一次 DSH 才会加载新代码；装了 `dsh-hmr` 的话重载插件即可（`plugin_reload`）。
 - 改了 `client.js`（界面）后，刷新一次 Web 页面即可；如果页面没变化，重启 DSH 兜底。
+
+### 踩过的坑：plugin_reload 报 EPERM
+
+现象：`EPERM: operation not permitted, rename '…\cordis.patch.yml.tmp-<pid>' -> '…\cordis.patch.yml'`。
+
+原因是写 profile 目录时被沙箱拦在了 rename 这一步，会留下一个同名 `cordis.patch.yml.tmp-<pid>` 残留。
+**处理：删掉那个 tmp 文件再重试一次即可**，第二次必成（patch 内容没变，只是 mtime 和 tick 行在重写）。
+不要因此去手工改 `cordis.patch.yml` 的 tick —— tick 是重载的触发凭证，手改不会触发重组。
 
 ## 隐私
 

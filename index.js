@@ -128,12 +128,34 @@ const PEEK_RESUME_LINGER_MS = 10_000
 const PEEK_RESUME_WATCHDOG_MS = 10 * 60_000
 
 const PURPOSE_DAILY_MAX_DEFAULT = 4
+/** 两次主动之间的间隔（分钟）：卡上可调，默认 60–120。 */
+const PURPOSE_GAP_MIN_DEFAULT = 60
+const PURPOSE_GAP_MAX_DEFAULT = 120
+const PURPOSE_GAP_FLOOR = 5
+const PURPOSE_GAP_CEIL = 1440
 
 /** 一天最多主动几次：0 表示不主动，上限 24；非法值退回默认。 */
 function clampDailyMax(value, fallback = PURPOSE_DAILY_MAX_DEFAULT) {
   const number = Number(value)
   if (!Number.isFinite(number)) return fallback
   return Math.max(0, Math.min(24, Math.round(number)))
+}
+
+/** 间隔分钟数：5–1440，非法值退回 fallback。 */
+function clampGapMinutes(value, fallback) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.max(PURPOSE_GAP_FLOOR, Math.min(PURPOSE_GAP_CEIL, Math.round(number)))
+}
+
+/**
+ * 这张卡的间隔上下限（毫秒）。min > max 时把 max 抬到 min，
+ * 免得随机区间变成负数把下一次排到过去。
+ */
+function purposeGapMs(persona) {
+  const minGapMs = clampGapMinutes(persona?.purposeMinGapMinutes, PURPOSE_GAP_MIN_DEFAULT) * 60_000
+  const maxRaw = clampGapMinutes(persona?.purposeMaxGapMinutes, PURPOSE_GAP_MAX_DEFAULT) * 60_000
+  return { minGapMs, maxGapMs: Math.max(minGapMs, maxRaw) }
 }
 
 /**
@@ -215,9 +237,12 @@ function ensurePurposeDay(state, now = Date.now()) {
 }
 
 /** 排下一次触发时间：间隔在 [min, max] 里随机；落进安静时段就推到安静结束。 */
-function planNextFire({ now = Date.now(), config = PURPOSE_DEFAULT_CONFIG, random = Math.random } = {}) {
-  const span = Math.max(1, config.maxGapMs - config.minGapMs)
-  const at = now + config.minGapMs + Math.floor(random() * span)
+function planNextFire({ now = Date.now(), config = PURPOSE_DEFAULT_CONFIG, random = Math.random, minGapMs, maxGapMs } = {}) {
+  // 卡的间隔优先；没传就退回全局默认（60–120 分钟之外还想覆盖的话走 config）。
+  const lo = Number.isFinite(Number(minGapMs)) ? Number(minGapMs) : config.minGapMs
+  const hi = Number.isFinite(Number(maxGapMs)) ? Number(maxGapMs) : config.maxGapMs
+  const span = Math.max(1, hi - lo)
+  const at = now + lo + Math.floor(random() * span)
   return inQuietHours(at, config) ? quietEndAfter(at, config) : at
 }
 
@@ -260,7 +285,16 @@ function evaluatePurposeTick({ now = Date.now(), config = PURPOSE_DEFAULT_CONFIG
   if (lastActivity > 0 && now - lastActivity < config.idleThresholdMs) {
     return { fire: false, reason: 'owner-active', nextAt: lastActivity + config.idleThresholdMs }
   }
-  if (card.purposeNextAt === 0) return { fire: false, reason: 'not-planned', nextAt: planNextFire({ now, config, random }) }
+  // 首次排程走 initialDelayMs（开启后先短等一次），之后才进入 2.5–5 小时的随机循环。
+  if (card.purposeNextAt === 0) {
+    const wait = clampInt(config.initialDelayMs, 30 * 60_000, 60_000, 24 * 60 * 60_000)
+    const first = now + wait
+    return {
+      fire: false,
+      reason: 'not-planned',
+      nextAt: inQuietHours(first, config) ? quietEndAfter(first, config) : first,
+    }
+  }
   if (now < card.purposeNextAt) return { fire: false, reason: 'waiting' }
   if (materialCount < config.minMaterials) {
     return { fire: false, reason: 'thin-materials', nextAt: now + config.retryMs }
@@ -352,6 +386,42 @@ function pickSeeds(seeds, current = Date.now(), limit = 3) {
 }
 const MEMORY_KINDS = ['fact', 'preference', 'plan', 'event']
 const MEMORY_IMPORTANCE_DEFAULT = 3
+
+/**
+ * 自动记忆：从第一人称陈述里捞「关于这个人的稳定事实」。
+ * 门槛故意卡高——只认明确的「我 + 状态动词」句式，问句和假设一律不碰。
+ * 抓到的东西重要度给 2（比手动记的低），所以不常用就会自然淡掉。
+ */
+const AUTO_MEMORY_PATTERNS = [
+  { kind: 'fact', pattern: /我(?:住在|来自|老家是|在做|在写|在搞|养了|用的是|叫)([^，。！？,.!?\s]{2,18})/ },
+  { kind: 'fact', pattern: /我(?:是|做)([一-龥]{2,10}(?:工程师|程序员|学生|老师|设计师|医生|运营|老板))/ },
+  { kind: 'preference', pattern: /我(?:喜欢|讨厌|爱吃|不爱吃|受不了|习惯|迷上了)([^，。！？,.!?\s]{2,18})/ },
+]
+const AUTO_MEMORY_MAX_PER_HARVEST = 2
+/** 自动记忆的节流窗口：同一会话 10 分钟内最多扫一遍。 */
+const MEMORY_HARVEST_MS = 10 * 60_000
+
+function mineMemories(text) {
+  const body = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (body.length < 5) return []
+  // 问句和假设不记：那不是事实陈述。
+  if (/[？?]\s*$/.test(body)) return []
+  if (/^(如果|要是|假如|假设)/.test(body)) return []
+  const out = []
+  for (const { kind, pattern } of AUTO_MEMORY_PATTERNS) {
+    const match = pattern.exec(body)
+    if (match === null) continue
+    const snippet = match[0].trim()
+    if (snippet.length < 4 || snippet.length > 40) continue
+    // 片段本身带疑问尾巴的，就是问句不是陈述。
+    if (/(什么|啥|哪|谁|吗|呢|怎么|多少|几)$/.test(snippet)) continue
+    // 代码/符号混排的不算口语陈述（正则片段、路径、URL 都在这被挡掉）。
+    if (/[\/|`*()\[\]{}<>#=_]/.test(snippet)) continue
+    if (out.some((item) => item.text === snippet)) continue
+    out.push({ kind, text: snippet })
+  }
+  return out
+}
 
 function normalizeMemoryRecord(raw, current = Date.now()) {
   const record = raw !== null && typeof raw === 'object' ? raw : {}
@@ -806,6 +876,10 @@ function normalizePersona(input, existing) {
         purposeEnabled: false,
         purposeDailyMax: PURPOSE_DAILY_MAX_DEFAULT,
         purposeRunOnBusy: false,
+        purposeMinGapMinutes: PURPOSE_GAP_MIN_DEFAULT,
+        purposeMaxGapMinutes: PURPOSE_GAP_MAX_DEFAULT,
+        /** 自动记忆：从对方说的话里捞事实和偏好，默认关。 */
+        autoMemory: false,
         archived: false,
       }
     : { ...existing }
@@ -851,6 +925,16 @@ function normalizePersona(input, existing) {
   if (!Number.isFinite(Number(out.purposeDailyMax)) || Number(out.purposeDailyMax) < 0) out.purposeDailyMax = PURPOSE_DAILY_MAX_DEFAULT
   if (input.purposeRunOnBusy !== undefined) out.purposeRunOnBusy = input.purposeRunOnBusy === true
   if (out.purposeRunOnBusy !== true) out.purposeRunOnBusy = false
+  if (input.purposeMinGapMinutes !== undefined) out.purposeMinGapMinutes = clampGapMinutes(input.purposeMinGapMinutes, PURPOSE_GAP_MIN_DEFAULT)
+  if (!Number.isFinite(Number(out.purposeMinGapMinutes))) out.purposeMinGapMinutes = PURPOSE_GAP_MIN_DEFAULT
+  if (input.purposeMaxGapMinutes !== undefined) out.purposeMaxGapMinutes = clampGapMinutes(input.purposeMaxGapMinutes, PURPOSE_GAP_MAX_DEFAULT)
+  if (!Number.isFinite(Number(out.purposeMaxGapMinutes))) out.purposeMaxGapMinutes = PURPOSE_GAP_MAX_DEFAULT
+  // 上限不能小于下限：存的时候就纠正，别等到排程时算出负数区间。
+  if (Number(out.purposeMaxGapMinutes) < Number(out.purposeMinGapMinutes)) {
+    out.purposeMaxGapMinutes = Number(out.purposeMinGapMinutes)
+  }
+  if (input.autoMemory !== undefined) out.autoMemory = input.autoMemory === true
+  if (out.autoMemory !== true) out.autoMemory = false
   if (input.peekBusyRanges !== undefined) out.peekBusyRanges = clean(input.peekBusyRanges, MAX_PEEK_RANGES_CHARS)
   if (typeof out.peekBusyRanges !== 'string') out.peekBusyRanges = PEEK_BUSY_RANGES_DEFAULT
   if (input.peekBusyEveryMinutes !== undefined) {
@@ -895,6 +979,12 @@ function summaryOf(persona) {
     purposeEnabled: persona.purposeEnabled === true,
     purposeDailyMax: clampDailyMax(persona.purposeDailyMax),
     purposeRunOnBusy: persona.purposeRunOnBusy === true,
+    purposeMinGapMinutes: clampGapMinutes(persona.purposeMinGapMinutes, PURPOSE_GAP_MIN_DEFAULT),
+    purposeMaxGapMinutes: Math.max(
+      clampGapMinutes(persona.purposeMinGapMinutes, PURPOSE_GAP_MIN_DEFAULT),
+      clampGapMinutes(persona.purposeMaxGapMinutes, PURPOSE_GAP_MAX_DEFAULT),
+    ),
+    autoMemory: persona.autoMemory === true,
     revision: persona.revision,
     updatedAt: persona.updatedAt,
     archived: persona.archived === true,
@@ -1164,6 +1254,11 @@ function selectNotes(state, query, current = Date.now()) {
 function compileRuntime(persona, state, query, current = Date.now(), memories = []) {
   if (persona === undefined || persona === null) return { text: '', trace: null }
   const blocks = []
+  // 带人格的会话：思考过程一律中文。放最前面，避免被尾部截断吃掉。
+  blocks.push([
+    '[思考语言]',
+    '你的内部推理与思考过程一律用中文写，不要用英文。',
+  ].join('\n'))
   const scene = clean(state?.scene, 1000)
   if (scene !== '') blocks.push(`[Scene]\n${escapePersonaBody(scene)}`)
   const mood = clean(state?.mood, 200)
@@ -1187,6 +1282,16 @@ function compileRuntime(persona, state, query, current = Date.now(), memories = 
       '[Long-term memories]',
       '这些是你以前记下的、跨会话还在的事。贴题时自然提一句，不要罗列。',
       ...memories.map((line) => `- ${escapePersonaBody(line)}`),
+    ].join('\n'))
+  }
+
+  // 自动记忆：不靠正则猜，改成让模型按上下文自己判断（只在卡上开了才出现）。
+  if (persona.autoMemory === true) {
+    blocks.push([
+      '[记忆]',
+      '对方说的这些值得跨会话记住：关于他自己的事（在哪、做什么、养了什么）、明确的偏好（喜欢什么、讨厌什么）、和没兑现的约定。',
+      '碰到就调 persona 工具、action 用 memorize 记一条，一句话说清。一轮最多记一条。',
+      '这轮的任务细节、临时状态、情绪不要记；已经在上面列出的事不要重复记。',
     ].join('\n'))
   }
 
@@ -1398,6 +1503,15 @@ class PersonaStore {
     if (current === undefined) throw new Error(`找不到人格「${id}」。`)
     const next = normalizePersona({ ...current, ...(patch ?? {}) }, current)
     await this.personas.put(current.id, next)
+    // 目的机制从关变开：把这张卡名下的排程清零，让它重新走「首轮 30 分钟」，
+    // 而不是接着一个几天前的 purposeNextAt 干等。
+    if (current.purposeEnabled !== true && next.purposeEnabled === true) {
+      try {
+        await this.resetPurposeSchedule(next.id)
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: purpose schedule reset failed: %o', error)
+      }
+    }
     return next
   }
 
@@ -1459,6 +1573,37 @@ class PersonaStore {
     }
     await this.states.put(stateKey(sessionId, personaId), next)
     return next
+  }
+
+  /**
+   * 目的机制从关变开时清排程：把这张卡名下所有会话的 nextAt / attempts 归零，
+   * 下次 tick 就会按 initialDelayMs 重新排一个「30 分钟后」。
+   * 按 stateKey 后缀找，连以前绑过、后来换掉的会话也一起重置，
+   * 免得用户切回来时撞上一个陈年倒计时。
+   */
+  async resetPurposeSchedule(personaId) {
+    const target = String(personaId)
+    const suffix = `::${target}`
+    let cleared = 0
+    let keys = []
+    try {
+      keys = [...this.states.keys()]
+    } catch {
+      return 0
+    }
+    for (const key of keys) {
+      if (!String(key).endsWith(suffix)) continue
+      const stored = this.states.get(key)
+      if (stored === null || typeof stored !== 'object') continue
+      if (Number(stored.purposeNextAt) === 0 && Number(stored.purposeAttempts) === 0) continue
+      const sessionId = typeof stored.sessionId === 'string' && stored.sessionId !== ''
+        ? stored.sessionId
+        : String(key).slice(0, -suffix.length)
+      const state = this.getState(sessionId, target)
+      await this.putState(sessionId, target, { ...state, purposeNextAt: 0, purposeAttempts: 0 })
+      cleared++
+    }
+    return cleared
   }
 
   /** 记忆卡（MVP）：per-persona 的长期记忆，跨会话累积，跟会话正史分开放。 */
@@ -1568,6 +1713,40 @@ class PersonaStore {
     const next = [...existing, ...fresh].slice(-MAX_SEEDS)
     await this.putSeeds(personaId, next)
     return { added: fresh.length, total: next.length }
+  }
+
+  /** 自动记忆：从素材里捞稳定事实，去重后按低权重写进长期记忆。 */
+  async harvestMemories(personaId, materials, owner = '', at = now()) {
+    const existing = this.listMemories(personaId)
+    const fresh = []
+    for (const item of Array.isArray(materials) ? materials : []) {
+      if (fresh.length >= AUTO_MEMORY_MAX_PER_HARVEST) break
+      // 只从对方说的话里挖：「我」说的是他自己，不是我的输出。
+      if (item.role !== 'user') continue
+      for (const hit of mineMemories(item.text)) {
+        if (fresh.length >= AUTO_MEMORY_MAX_PER_HARVEST) break
+        const duplicate = existing.some((kept) => memorySimilarity(kept.text, hit.text) > 0.62)
+          || fresh.some((kept) => memorySimilarity(kept.text, hit.text) > 0.62)
+        if (duplicate) continue
+        fresh.push({
+          id: `m_${randomUUID()}`,
+          text: hit.text,
+          kind: hit.kind,
+          importance: 2,
+          pinned: false,
+          firstMet: false,
+          owner: typeof owner === 'string' ? owner : '',
+          mergedCount: 1,
+          tags: [],
+          createdAt: at,
+          lastSeenAt: at,
+          source: 'auto',
+        })
+      }
+    }
+    if (fresh.length === 0) return { added: 0, total: existing.length }
+    const next = await this.putMemories(personaId, [...existing, ...fresh])
+    return { added: fresh.length, total: next.records.length }
   }
 
   /** 标记这几颗种子问过了，冷却期内不再重复。 */
@@ -2084,6 +2263,23 @@ function lastUserAt(session) {
   return 0
 }
 
+/** 会话里最后一条对话消息的时间（user 或 assistant）。没有就 0。 */
+function lastMessageAt(session) {
+  if (session === null || session === undefined || typeof session.deriveMessages !== 'function') return 0
+  try {
+    const messages = session.deriveMessages()
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const role = messages[i]?.role
+      if (role !== 'user' && role !== 'assistant') continue
+      const at = Number(messages[i]?.time ?? messages[i]?.createdAt ?? 0)
+      if (Number.isFinite(at) && at > 0) return at
+    }
+  } catch {
+    return 0
+  }
+  return 0
+}
+
 /** 从 QQ bridge 的消息前缀里认人：`… (QQ 591396639) …`。认不出来就没有 owner。 */
 function ownerOfSession(session) {
   if (session === null || session === undefined || typeof session.deriveMessages !== 'function') return ''
@@ -2139,8 +2335,37 @@ class PeekPilot {
     for (const sessionId of [...this.resumed.keys()]) this.releaseResumed(sessionId)
   }
 
-  async tick() {
-    let sessionIds = []
+  /**
+   * 自动记忆的节流入口：每 10 分钟最多扫一遍最近素材。
+   * 和目的/窥屏无关，所以关掉主动机制也会继续记。
+   */
+  async harvestSessionMemories(sessionId) {
+    const active = this.store.active(sessionId)
+    if (active === null) return { added: 0 }
+    // 每张卡自己决定要不要被自动记：没勾的卡一点数据都不收。
+    if (active.persona.autoMemory !== true) return { added: 0 }
+    if (this.isArchived(sessionId)) return { added: 0 }
+    const session = this.store.session(sessionId)
+    // 没有新消息就不扫：省掉空转，也不白白吃掉 10 分钟窗口。
+    const latest = lastMessageAt(session)
+    const state = this.store.getState(sessionId, active.persona.id)
+    if (latest > 0 && latest <= (Number(state.memorySeenAt) || 0)) return { added: 0 }
+    if (now() - (Number(state.memoryHarvestAt) || 0) < MEMORY_HARVEST_MS) return { added: 0 }
+    const materials = collectMaterials(session, PURPOSE_DEFAULT_CONFIG)
+    const owner = ownerOfSession(session)
+    const result = materials.length === 0
+      ? { added: 0 }
+      : await this.store.harvestMemories(active.persona.id, materials, owner, now())
+    const fresh = this.store.getState(sessionId, active.persona.id)
+    await this.store.putState(sessionId, active.persona.id, {
+      ...fresh,
+      memoryHarvestAt: now(),
+      memorySeenAt: Math.max(latest, Number(fresh.memorySeenAt) || 0),
+    })
+    return result
+  }
+
+  async tick() {    let sessionIds = []
     try {
       sessionIds = [...this.store.bindings.keys()]
     } catch {
@@ -2148,6 +2373,8 @@ class PeekPilot {
     }
     for (const sessionId of sessionIds) {
       try {
+        // 自动记忆已经改成「模型按上下文判断 + 主动调 memorize」，
+        // 这里不再定时扫素材（函数留着，方便以后想换回来）。
         // 目的机制开着就整段接管：窥屏完全停用，不再按自己的间隔另开口。
         // 一天最多几次主动，其余时间安静——这就是「让位」。
         const active = this.store.active(sessionId)
@@ -2228,7 +2455,7 @@ class PeekPilot {
         purposeLastAt: at,
         purposeCount: card.purposeCount + 1,
         purposeAttempts: card.purposeAttempts + 1,
-        purposeNextAt: planNextFire({ now: at, config }),
+        purposeNextAt: planNextFire({ now: at, config, ...purposeGapMs(active.persona) }),
         purposeHistory: history,
       })
       if (resumed) {
@@ -2609,7 +2836,8 @@ async function enrichPersona(ctx, store, agent, ref, overwrite) {
   return { persona: next, filled, route, changed: true }
 }
 
-function toolPatch(args) {  const patch = {}
+function toolPatch(args) {
+  const patch = {}
   for (const field of TEXT_FIELDS) {
     if (args[field] !== undefined) patch[field] = args[field]
   }
@@ -2748,6 +2976,8 @@ export async function apply(ctx) {
         note: { type: 'string', description: 'For remember: the canon fact to add to this session.' },
         noteId: { type: 'string', description: 'For forget/pin: the note id (or a unique fragment of its text).' },
         memory: { type: 'string', description: "For memorize: one sentence to keep in the card's long-term memory (cross-session). For forget-memory: an id or text fragment." },
+  // 自动记忆的时机说明：只在卡上开了 autoMemory 的会话里才会被当做指令执行。
+  // 这里再写一遍，是因为工具描述比 runtime 注入更靠后，模型最后看到的是它。
         memoryId: { type: 'string', description: 'For forget-memory: the memory id (or a unique fragment of its text).' },
         importance: { type: 'number', description: 'For memorize: 0-5, how much this matters. Higher importance decays slower; default 3.' },
         kind: { type: 'string', description: 'For memorize: fact | preference | plan | event. Default fact.' },
@@ -3349,6 +3579,8 @@ export const __test = {
   selectNotes,
   allocateEntries,
   enrichPersona,
+  purposeGapMs,
+  clampGapMinutes,
   normalizePersona,
   deriveTagCode,
   tagBlockOf,
@@ -3373,6 +3605,9 @@ export const __test = {
   queryHits,
   selectMemories,
   trimMemories,
+  lastMessageAt,
+  mineMemories,
+  normalizePersonaForTest: (input) => normalizePersona(input),
   mineSeeds,
   pickSeeds,
   seedDueAt,
