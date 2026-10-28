@@ -25,6 +25,7 @@ const DOMAIN_SPEC = {
     personas: { valueSchema: { parse: (value) => value } },
     bindings: { valueSchema: { parse: (value) => value } },
     states: { valueSchema: { parse: (value) => value } },
+    memories: { valueSchema: { parse: (value) => value } },
   },
 }
 
@@ -116,10 +117,391 @@ const MASTER_NAME_DEFAULT = '主人'
 const PEEK_DEFAULT_MINUTES = 15
 const PEEK_DEFAULT_CHANCE = 30
 const MAX_PEEK_MINUTES = 240
+/** 高峰 / 空闲分档：高峰段默认更黏（看勤一点、开口概率高一点）。 */
+const PEEK_BUSY_DEFAULT_MINUTES = 5
+const PEEK_BUSY_DEFAULT_CHANCE = 60
+const PEEK_BUSY_RANGES_DEFAULT = '09:00-12:00, 14:00-18:00'
+const MAX_PEEK_RANGES_CHARS = 200
 const PEEK_TICK_MS = 60_000
 /** 窥屏自己 resume 出来的 agent：一轮结束后驻留多久再归还，以及没等到 turn/end 时的兜底。 */
 const PEEK_RESUME_LINGER_MS = 10_000
 const PEEK_RESUME_WATCHDOG_MS = 10 * 60_000
+
+const PURPOSE_DAILY_MAX_DEFAULT = 4
+
+/** 一天最多主动几次：0 表示不主动，上限 24；非法值退回默认。 */
+function clampDailyMax(value, fallback = PURPOSE_DAILY_MAX_DEFAULT) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.max(0, Math.min(24, Math.round(number)))
+}
+
+/**
+ * 目的（purpose）机制 P0：不是定时抛硬币，而是「到点了、不吵人、有话说」才开口。
+ *
+ * 这一层只做调度与素材：间隔随机、每日上限、安静时段、主人刚说完话不插嘴、
+ * 素材不够不硬找。目标假设 / 状态机那一层（P2）先不做。
+ */
+const PURPOSE_DEFAULT_CONFIG = Object.freeze({
+  minGapMs: 150 * 60_000,
+  maxGapMs: 300 * 60_000,
+  initialDelayMs: 30 * 60_000,
+  dailyMax: PURPOSE_DAILY_MAX_DEFAULT,
+  quietStart: '23:30',
+  quietEnd: '08:30',
+  /** 主人最近说过话时先不打扰（毫秒）。 */
+  idleThresholdMs: 30 * 60_000,
+  /** 素材窗口与条数上限。 */
+  materialWindowMs: 72 * 60 * 60_000,
+  maxMaterials: 24,
+  minMaterials: 2,
+  /** 投递失败/被跳过后多久重试。 */
+  retryMs: 15 * 60_000,
+  maxAttempts: 3,
+  historyLimit: 40,
+})
+
+function clampInt(value, fallback, min, max) {
+  const raw = Number(value)
+  if (!Number.isFinite(raw)) return fallback
+  return Math.max(min, Math.min(max, Math.round(raw)))
+}
+
+/** `"8:00"` / `"08:00"` → 当天分钟数；非法值回退 fallback。 */
+function parseClock(value, fallback = '08:00') {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(value ?? '').trim())
+  if (match === null) return parseClock(fallback, '00:00')
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) return parseClock(fallback, '00:00')
+  return hour * 60 + minute
+}
+
+function localDayKey(at = Date.now()) {
+  const date = new Date(at)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function minutesOfDay(at) {
+  const date = new Date(at)
+  return date.getHours() * 60 + date.getMinutes()
+}
+
+/** 安静时段是否包含 now；start === end 视为不启用。跨夜（23:30-08:30）是常态。 */
+function inQuietHours(now, config = PURPOSE_DEFAULT_CONFIG) {
+  const start = parseClock(config.quietStart)
+  const end = parseClock(config.quietEnd)
+  if (start === end) return false
+  const minutes = minutesOfDay(now)
+  return start < end ? minutes >= start && minutes < end : minutes >= start || minutes < end
+}
+
+/** 下一个「安静结束」时刻（严格晚于 now）。 */
+function quietEndAfter(now, config = PURPOSE_DEFAULT_CONFIG) {
+  const end = parseClock(config.quietEnd)
+  const date = new Date(now)
+  const candidate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), Math.floor(end / 60), end % 60, 0, 0)
+  if (candidate.getTime() <= now) candidate.setDate(candidate.getDate() + 1)
+  return candidate.getTime()
+}
+
+/** 跨天重置今日次数（不重置 nextAt，排程会自己纠正）。 */
+function ensurePurposeDay(state, now = Date.now()) {
+  const today = localDayKey(now)
+  if (state.purposeDay === today) return state
+  state.purposeDay = today
+  state.purposeCount = 0
+  return state
+}
+
+/** 排下一次触发时间：间隔在 [min, max] 里随机；落进安静时段就推到安静结束。 */
+function planNextFire({ now = Date.now(), config = PURPOSE_DEFAULT_CONFIG, random = Math.random } = {}) {
+  const span = Math.max(1, config.maxGapMs - config.minGapMs)
+  const at = now + config.minGapMs + Math.floor(random() * span)
+  return inQuietHours(at, config) ? quietEndAfter(at, config) : at
+}
+
+function normalizePurposeState(raw, now = Date.now()) {
+  const state = raw !== null && typeof raw === 'object' ? raw : {}
+  const out = {
+    purposeNextAt: Number.isFinite(Number(state.purposeNextAt)) ? Number(state.purposeNextAt) : 0,
+    purposeLastAt: Number.isFinite(Number(state.purposeLastAt)) ? Number(state.purposeLastAt) : 0,
+    purposeCount: clampInt(state.purposeCount, 0, 0, 999),
+    purposeDay: typeof state.purposeDay === 'string' ? state.purposeDay : '',
+    purposeAttempts: clampInt(state.purposeAttempts, 0, 0, 999),
+    purposeHistory: Array.isArray(state.purposeHistory)
+      ? state.purposeHistory.filter((item) => typeof item === 'string').slice(-PURPOSE_DEFAULT_CONFIG.historyLimit)
+      : [],
+  }
+  return ensurePurposeDay(out, now)
+}
+
+/**
+ * 这一刻该不该开口。
+ * @returns {{ fire: boolean, reason: string, nextAt?: number }}
+ */
+function evaluatePurposeTick({ now = Date.now(), config = PURPOSE_DEFAULT_CONFIG, state, lastMasterAt = 0, materialCount = 0, random = Math.random, dailyCount, lastFireAt, busy = false, busyUntil = 0, dailyMax, allowBusy = false } = {}) {
+  const card = normalizePurposeState(state, now)
+  // dailyCount / lastFireAt 由调用方按「卡」传进来（跨会话共享）；没传就退回按会话的 state。
+  const count = Number.isFinite(Number(dailyCount)) ? Number(dailyCount) : card.purposeCount
+  const lastFire = Number.isFinite(Number(lastFireAt)) ? Number(lastFireAt) : card.purposeLastAt
+  const limit = clampDailyMax(dailyMax, config.dailyMax)
+  if (inQuietHours(now, config)) return { fire: false, reason: 'quiet' }
+  // 高峰期默认整段不开口；卡上允许「高峰也跑」时才放行。
+  if (busy === true && allowBusy !== true) {
+    return { fire: false, reason: 'busy-hours', nextAt: Number.isFinite(Number(busyUntil)) && Number(busyUntil) > now ? Number(busyUntil) : now + config.retryMs }
+  }
+  if (count >= limit) {
+    const tomorrow = new Date(now)
+    tomorrow.setHours(24, 5, 0, 0)
+    return { fire: false, reason: 'daily-max', nextAt: tomorrow.getTime() }
+  }
+  const lastActivity = Math.max(lastFire, Number(lastMasterAt) || 0)
+  if (lastActivity > 0 && now - lastActivity < config.idleThresholdMs) {
+    return { fire: false, reason: 'owner-active', nextAt: lastActivity + config.idleThresholdMs }
+  }
+  if (card.purposeNextAt === 0) return { fire: false, reason: 'not-planned', nextAt: planNextFire({ now, config, random }) }
+  if (now < card.purposeNextAt) return { fire: false, reason: 'waiting' }
+  if (materialCount < config.minMaterials) {
+    return { fire: false, reason: 'thin-materials', nextAt: now + config.retryMs }
+  }
+  return { fire: true, reason: 'due' }
+}
+
+/**
+ * 记忆卡 MVP：per-persona（跨会话），带鲜活度衰减。
+ * 存一句话，想起来靠「重要度 × 鲜活度 × 命中」；首次相遇和置顶永远不淡。
+ */
+const MAX_MEMORIES = 120
+const MAX_MEMORY_ITEMS = 6
+const MAX_MEMORY_CHARS = 600
+const MAX_MEMORY_BACKUPS = 7
+
+/**
+ * 种子（purpose P1）：从对话里挖「想做 / 约了时间 / 没兑现的承诺」，
+ * 到点主动开口时优先问这些，而不是泛泛地找话说。
+ */
+const MAX_SEEDS = 60
+const SEED_ASK_COOLDOWN_MS = 6 * 24 * 60 * 60_000
+const SEED_PATTERNS = [
+  { kind: 'promise', pattern: /(回头|下次|改天|待会|晚点|再聊|再说|等我有空|等我忙完|答应)/ },
+  { kind: 'plan', pattern: /(明天|后天|周末|下周|下个月|考试|面试|加班|出差|生日|旅行|医院|搬家|开会|比赛|约会)/ },
+  { kind: 'drive', pattern: /(想去|想吃|想玩|想买|想试|想学|好想|求推荐)/ },
+]
+
+/** 粗估到期时间：只有「明天/后天/周末」敢拍，其余按两天后的提醒窗口。 */
+function seedDueAt(kind, text, current = Date.now()) {
+  const day = 24 * 60 * 60_000
+  if (kind === 'plan') {
+    if (text.includes('明天')) return current + day
+    if (text.includes('后天')) return current + 2 * day
+    if (text.includes('周末')) {
+      const date = new Date(current)
+      const gap = (6 - date.getDay() + 7) % 7 || 7
+      return current + gap * day
+    }
+    return current + 3 * day
+  }
+  return current + 2 * day
+}
+
+/** 一句话里能挖出的种子；同一句只留一次。 */
+function mineSeeds(text, current = Date.now()) {
+  const body = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (body.length < 4) return []
+  const out = []
+  const seen = new Set()
+  for (const { kind, pattern } of SEED_PATTERNS) {
+    const match = pattern.exec(body)
+    if (match === null) continue
+    const snippet = body
+      .slice(Math.max(0, match.index - 12), Math.min(body.length, match.index + match[0].length + 24))
+      .trim()
+    if (snippet.length < 4 || seen.has(snippet)) continue
+    seen.add(snippet)
+    out.push({ kind, text: snippet.slice(0, 80), dueAt: seedDueAt(kind, snippet, current) })
+  }
+  return out
+}
+
+function normalizeSeed(raw, current = Date.now()) {
+  const record = raw !== null && typeof raw === 'object' ? raw : {}
+  const text = clean(record.text, 120)
+  if (text === '') return null
+  return {
+    id: typeof record.id === 'string' && record.id !== '' ? record.id : `s_${randomUUID()}`,
+    kind: ['drive', 'plan', 'promise'].includes(record.kind) ? record.kind : 'drive',
+    text,
+    dueAt: Number.isFinite(Number(record.dueAt)) ? Number(record.dueAt) : current,
+    createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : current,
+    askedAt: Number.isFinite(Number(record.askedAt)) ? Number(record.askedAt) : 0,
+    askedCount: clampInt(record.askedCount, 0, 0, 99),
+  }
+}
+
+/** 该问哪些种子：没问够两次、上次问超过冷却期，按到期时间排。 */
+function pickSeeds(seeds, current = Date.now(), limit = 3) {
+  const list = (Array.isArray(seeds) ? seeds : [])
+    .map((seed) => normalizeSeed(seed, current))
+    .filter((seed) => seed !== null)
+    .filter((seed) => seed.askedCount < 2)
+    .filter((seed) => seed.askedAt === 0 || current - seed.askedAt > SEED_ASK_COOLDOWN_MS)
+    .filter((seed) => seed.dueAt <= current + 24 * 60 * 60_000)
+  list.sort((a, b) => a.dueAt - b.dueAt || a.createdAt - b.createdAt)
+  return list.slice(0, limit)
+}
+const MEMORY_KINDS = ['fact', 'preference', 'plan', 'event']
+const MEMORY_IMPORTANCE_DEFAULT = 3
+
+function normalizeMemoryRecord(raw, current = Date.now()) {
+  const record = raw !== null && typeof raw === 'object' ? raw : {}
+  const text = clean(record.text, 400)
+  if (text === '') return null
+  return {
+    id: typeof record.id === 'string' && record.id !== '' ? record.id : `m_${randomUUID()}`,
+    text,
+    kind: MEMORY_KINDS.includes(record.kind) ? record.kind : 'fact',
+    importance: clampInt(record.importance, MEMORY_IMPORTANCE_DEFAULT, 0, 5),
+    pinned: record.pinned === true,
+    firstMet: record.firstMet === true,
+    owner: typeof record.owner === 'string' ? record.owner.slice(0, 40) : '',
+    mergedCount: clampInt(record.mergedCount, 1, 1, 999),
+    tags: Array.isArray(record.tags)
+      ? record.tags.filter((tag) => typeof tag === 'string' && tag !== '').slice(0, 6)
+      : [],
+    createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : current,
+    lastSeenAt: Number.isFinite(Number(record.lastSeenAt)) ? Number(record.lastSeenAt) : current,
+    source: typeof record.source === 'string' ? record.source.slice(0, 120) : '',
+  }
+}
+
+/** 鲜活度：置顶 / 初次相遇恒为 1；其余按重要度给半衰期（7~67 天），只会淡不会被删。 */
+function memoryClarity(record, current = Date.now()) {
+  if (record?.pinned === true || record?.firstMet === true) return 1
+  const importance = clampInt(record?.importance, MEMORY_IMPORTANCE_DEFAULT, 0, 5)
+  const halfLifeDays = 7 + importance * 12
+  const ageDays = Math.max(0, (current - Number(record?.createdAt ?? current)) / 86_400_000)
+  return Math.max(0, Math.min(1, Math.pow(0.5, ageDays / halfLifeDays)))
+}
+
+/** 中文双字片段的粗命中数：够用、便宜，不需要分词库。 */
+function queryHits(text, query) {
+  const body = String(text ?? '')
+  const subject = String(query ?? '').replace(/\s+/g, '').slice(0, 80)
+  if (body === '' || subject === '') return 0
+  let hits = 0
+  for (let i = 0; i + 1 < subject.length; i += 1) {
+    if (body.includes(subject.slice(i, i + 2))) hits += 1
+  }
+  return hits
+}
+
+function memoryScore(record, query, current = Date.now(), owner = '') {
+  const clarity = memoryClarity(record, current)
+  const importance = clampInt(record?.importance, MEMORY_IMPORTANCE_DEFAULT, 0, 5) / 5
+  const hits = queryHits(record?.text, query)
+  const sameOwner = owner !== '' && record?.owner === owner ? 0.15 : 0
+  return { score: importance * 0.55 + clarity * 0.35 + Math.min(0.4, hits * 0.2) + sameOwner, clarity, hits }
+}
+
+/** 中文双字片段的集合，用来算两条记忆像不像。 */
+function memoryTokens(text) {
+  const body = String(text ?? '').toLowerCase().replace(/[\s\p{P}]+/gu, '')
+  const set = new Set()
+  for (let i = 0; i + 1 < body.length; i += 1) set.add(body.slice(i, i + 2))
+  return set
+}
+
+function memorySimilarity(a, b) {
+  const left = memoryTokens(a)
+  const right = memoryTokens(b)
+  if (left.size === 0 || right.size === 0) return 0
+  let shared = 0
+  for (const token of left) {
+    if (right.has(token)) shared += 1
+  }
+  return shared / (left.size + right.size - shared)
+}
+
+/**
+ * 压缩合并：同 kind、同 owner、文本够像的两条并成一条。
+ * 保留信息更全的那句，重要度取高、置顶/初遇取或、时间取交集，mergedCount 累加。
+ */
+function mergeDuplicateMemories(records, threshold = 0.62) {
+  const out = []
+  for (const record of Array.isArray(records) ? records : []) {
+    const existing = out.find((item) =>
+      item.kind === record.kind
+      && item.owner === record.owner
+      && memorySimilarity(item.text, record.text) >= threshold
+    )
+    if (existing === undefined) {
+      out.push({ ...record })
+      continue
+    }
+    const keepNewText = record.text.length > existing.text.length
+    const keepNewId = record.importance > existing.importance
+      || (record.importance === existing.importance && record.createdAt > existing.createdAt)
+    out[out.indexOf(existing)] = {
+      ...existing,
+      id: keepNewId ? record.id : existing.id,
+      text: keepNewText ? record.text : existing.text,
+      importance: Math.max(existing.importance, record.importance),
+      pinned: existing.pinned || record.pinned,
+      firstMet: existing.firstMet || record.firstMet,
+      tags: [...new Set([...(existing.tags ?? []), ...(record.tags ?? [])])].slice(0, 6),
+      createdAt: Math.min(existing.createdAt, record.createdAt),
+      lastSeenAt: Math.max(existing.lastSeenAt, record.lastSeenAt),
+      mergedCount: (existing.mergedCount ?? 1) + (record.mergedCount ?? 1),
+    }
+  }
+  return out
+}
+
+/** 超出上限时按「置顶优先 → 综合分」淘汰。 */
+function trimMemories(records, current = Date.now()) {
+  const list = Array.isArray(records) ? records : []
+  if (list.length <= MAX_MEMORIES) return list
+  const scored = list.map((record) => ({ record, score: memoryScore(record, '', current).score }))
+  scored.sort((a, b) => {
+    const keepA = a.record.pinned === true || a.record.firstMet === true ? 1 : 0
+    const keepB = b.record.pinned === true || b.record.firstMet === true ? 1 : 0
+    if (keepA !== keepB) return keepB - keepA
+    return b.score - a.score
+  })
+  return scored.slice(0, MAX_MEMORIES).map((item) => item.record)
+}
+
+function selectMemories(records, query, current = Date.now(), options = {}) {
+  const maxItems = options.maxItems ?? MAX_MEMORY_ITEMS
+  const budget = options.budget ?? MAX_MEMORY_CHARS
+  const owner = typeof options.owner === 'string' ? options.owner : ''
+  const list = (Array.isArray(records) ? records : [])
+    .map((record) => normalizeMemoryRecord(record, current))
+    .filter((record) => record !== null)
+    .map((record) => ({ record, ...memoryScore(record, query, current, owner) }))
+  list.sort((a, b) => {
+    const firstA = a.record.firstMet === true ? 1 : 0
+    const firstB = b.record.firstMet === true ? 1 : 0
+    if (firstA !== firstB) return firstB - firstA
+    const pinA = a.record.pinned === true ? 1 : 0
+    const pinB = b.record.pinned === true ? 1 : 0
+    if (pinA !== pinB) return pinB - pinA
+    return b.score - a.score || b.record.lastSeenAt - a.record.lastSeenAt
+  })
+  const picked = []
+  let used = 0
+  for (const item of list) {
+    if (picked.length >= maxItems) break
+    const when = formatNoteTime(item.record.createdAt, current)
+    const line = when === '' ? item.record.text : `${when}：${item.record.text}`
+    const cost = line.length + 3
+    if (used + cost > budget) continue
+    picked.push({ id: item.record.id, line, clarity: item.clarity, hits: item.hits })
+    used += cost
+  }
+  return { picked, chars: used, total: list.length }
+}
 
 /**
  * Custom form of address, stripped of quotes so it cannot break the sentence
@@ -129,6 +511,111 @@ const PEEK_RESUME_WATCHDOG_MS = 10 * 60_000
 function masterNameOf(persona) {
   const raw = clean(persona?.masterName, FIELD_LIMITS.masterName)
   return raw.replace(/[「」『』"]/g, '').trim()
+}
+
+/**
+ * 窥屏开关的最终值：会话自己的选择优先；这个会话没选过，就跟人格卡的默认值。
+ * 卡片上的开关只是“默认值”——同一个绑了这张卡的会话，可以单独开或关。
+ */
+function peekSwitch(binding, persona) {
+  if (binding !== null && typeof binding === 'object' && typeof binding.peek === 'boolean') return binding.peek
+  return persona?.peekEnabled === true
+}
+
+function clampPeekMinutes(value, fallback = PEEK_DEFAULT_MINUTES) {
+  const raw = Number(value)
+  if (!Number.isFinite(raw)) return fallback
+  return Math.max(0, Math.min(MAX_PEEK_MINUTES, Math.round(raw)))
+}
+
+function clampPeekChance(value, fallback = PEEK_DEFAULT_CHANCE) {
+  const raw = Number(value)
+  if (!Number.isFinite(raw)) return fallback
+  return Math.max(0, Math.min(100, Math.round(raw)))
+}
+
+function minuteOfDay(hourText, minuteText) {
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null
+  if (hour > 23 || minute > 59) return null
+  return hour * 60 + minute
+}
+
+/**
+ * "09:00-12:00, 14:00-18:00" → [{ start, end }]，单位是当天分钟数（0-1440）。
+ * 支持中文冒号、波浪线、至/到；跨夜区间（22:00-02:00）拆成两段，重叠的合并。
+ */
+function parseBusyRanges(raw) {
+  const text = typeof raw === 'string' ? raw : ''
+  const segments = []
+  const pattern = /(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:-|~|—|–|至|到)\s*(\d{1,2})\s*[:：]\s*(\d{2})/g
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const start = minuteOfDay(match[1], match[2])
+    const end = minuteOfDay(match[3], match[4])
+    if (start === null || end === null) continue
+    if (start === end) {
+      segments.push({ start: 0, end: 1440 })
+    } else if (start < end) {
+      segments.push({ start, end })
+    } else {
+      segments.push({ start, end: 1440 })
+      segments.push({ start: 0, end })
+    }
+  }
+  segments.sort((a, b) => a.start - b.start)
+  const merged = []
+  for (const segment of segments) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && segment.start <= last.end) last.end = Math.max(last.end, segment.end)
+    else merged.push({ ...segment })
+  }
+  return merged
+}
+
+function formatBusyRanges(ranges) {
+  return ranges
+    .map((range) => {
+      const start = `${String(Math.floor(range.start / 60)).padStart(2, '0')}:${String(range.start % 60).padStart(2, '0')}`
+      const endMinutes = range.end === 1440 ? 1440 : range.end
+      const end = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`
+      return `${start}-${end}`
+    })
+    .join(', ')
+}
+
+/** 当前这波高峰还要持续到几点（时间戳）；不在高峰里返回 0。 */
+function busyUntilAt(ranges, current = Date.now()) {
+  const date = new Date(current)
+  const minutes = date.getHours() * 60 + date.getMinutes()
+  const range = ranges.find((item) => minutes >= item.start && minutes < item.end)
+  if (range === undefined) return 0
+  const end = new Date(current)
+  end.setHours(0, 0, 0, 0)
+  end.setMinutes(range.end)
+  return end.getTime()
+}
+
+/**
+ * 此刻算哪一档，以及这一档该用的间隔和概率。
+ * 高峰时段（peekBusyRanges）用高峰那一组；其余时间用 peekEveryMinutes / peekChance。
+ * 间隔 0 表示这一档完全不看。
+ */
+function peekProfile(persona, current = Date.now()) {
+  const idleEvery = clampPeekMinutes(persona?.peekEveryMinutes)
+  const idleChance = clampPeekChance(persona?.peekChance)
+  const ranges = persona?.peekScheduleEnabled === true ? parseBusyRanges(persona?.peekBusyRanges) : []
+  if (ranges.length === 0) return { phase: 'idle', ranges, everyMinutes: idleEvery, chance: idleChance }
+  const minutes = new Date(current).getHours() * 60 + new Date(current).getMinutes()
+  const busy = ranges.some((range) => minutes >= range.start && minutes < range.end)
+  if (!busy) return { phase: 'idle', ranges, everyMinutes: idleEvery, chance: idleChance }
+  return {
+    phase: 'busy',
+    ranges,
+    everyMinutes: clampPeekMinutes(persona?.peekBusyEveryMinutes, PEEK_BUSY_DEFAULT_MINUTES),
+    chance: clampPeekChance(persona?.peekBusyChance, PEEK_BUSY_DEFAULT_CHANCE),
+  }
 }
 
 /** Action beats: short, visible, in full-width brackets — not narration. */
@@ -312,6 +799,13 @@ function normalizePersona(input, existing) {
         peekEnabled: false,
         peekEveryMinutes: PEEK_DEFAULT_MINUTES,
         peekChance: PEEK_DEFAULT_CHANCE,
+        peekScheduleEnabled: false,
+        peekBusyRanges: PEEK_BUSY_RANGES_DEFAULT,
+        peekBusyEveryMinutes: PEEK_BUSY_DEFAULT_MINUTES,
+        peekBusyChance: PEEK_BUSY_DEFAULT_CHANCE,
+        purposeEnabled: false,
+        purposeDailyMax: PURPOSE_DAILY_MAX_DEFAULT,
+        purposeRunOnBusy: false,
         archived: false,
       }
     : { ...existing }
@@ -345,18 +839,28 @@ function normalizePersona(input, existing) {
   if (!Number.isFinite(out.memeFrequency)) out.memeFrequency = MEME_FREQUENCY_DEFAULT
   if (input.peekEnabled !== undefined) out.peekEnabled = input.peekEnabled === true
   if (out.peekEnabled !== true && out.peekEnabled !== false) out.peekEnabled = false
-  if (input.peekEveryMinutes !== undefined) {
-    const raw = Number(input.peekEveryMinutes)
-    out.peekEveryMinutes = Number.isFinite(raw)
-      ? Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(raw)))
-      : PEEK_DEFAULT_MINUTES
+  if (input.peekEveryMinutes !== undefined) out.peekEveryMinutes = clampPeekMinutes(input.peekEveryMinutes)
+  if (!Number.isFinite(Number(out.peekEveryMinutes))) out.peekEveryMinutes = PEEK_DEFAULT_MINUTES
+  if (input.peekChance !== undefined) out.peekChance = clampPeekChance(input.peekChance)
+  if (!Number.isFinite(Number(out.peekChance))) out.peekChance = PEEK_DEFAULT_CHANCE
+  if (input.peekScheduleEnabled !== undefined) out.peekScheduleEnabled = input.peekScheduleEnabled === true
+  if (out.peekScheduleEnabled !== true && out.peekScheduleEnabled !== false) out.peekScheduleEnabled = false
+  if (input.purposeEnabled !== undefined) out.purposeEnabled = input.purposeEnabled === true
+  if (out.purposeEnabled !== true && out.purposeEnabled !== false) out.purposeEnabled = false
+  if (input.purposeDailyMax !== undefined) out.purposeDailyMax = clampDailyMax(input.purposeDailyMax)
+  if (!Number.isFinite(Number(out.purposeDailyMax)) || Number(out.purposeDailyMax) < 0) out.purposeDailyMax = PURPOSE_DAILY_MAX_DEFAULT
+  if (input.purposeRunOnBusy !== undefined) out.purposeRunOnBusy = input.purposeRunOnBusy === true
+  if (out.purposeRunOnBusy !== true) out.purposeRunOnBusy = false
+  if (input.peekBusyRanges !== undefined) out.peekBusyRanges = clean(input.peekBusyRanges, MAX_PEEK_RANGES_CHARS)
+  if (typeof out.peekBusyRanges !== 'string') out.peekBusyRanges = PEEK_BUSY_RANGES_DEFAULT
+  if (input.peekBusyEveryMinutes !== undefined) {
+    out.peekBusyEveryMinutes = clampPeekMinutes(input.peekBusyEveryMinutes, PEEK_BUSY_DEFAULT_MINUTES)
   }
-  if (!Number.isFinite(out.peekEveryMinutes)) out.peekEveryMinutes = PEEK_DEFAULT_MINUTES
-  if (input.peekChance !== undefined) {
-    const raw = Number(input.peekChance)
-    out.peekChance = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : PEEK_DEFAULT_CHANCE
+  if (!Number.isFinite(Number(out.peekBusyEveryMinutes))) out.peekBusyEveryMinutes = PEEK_BUSY_DEFAULT_MINUTES
+  if (input.peekBusyChance !== undefined) {
+    out.peekBusyChance = clampPeekChance(input.peekBusyChance, PEEK_BUSY_DEFAULT_CHANCE)
   }
-  if (!Number.isFinite(out.peekChance)) out.peekChance = PEEK_DEFAULT_CHANCE
+  if (!Number.isFinite(Number(out.peekBusyChance))) out.peekBusyChance = PEEK_BUSY_DEFAULT_CHANCE
   if (input.archived !== undefined) out.archived = input.archived === true
   out.name = clean(out.name, FIELD_LIMITS.name)
   if (out.name === '') out.name = existing?.name ?? '未命名人格'
@@ -382,12 +886,15 @@ function summaryOf(persona) {
       ? Math.max(0, Math.min(100, Math.round(Number(persona.memeFrequency))))
       : MEME_FREQUENCY_DEFAULT,
     peekEnabled: persona.peekEnabled === true,
-    peekEveryMinutes: Number.isFinite(Number(persona.peekEveryMinutes))
-      ? Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(Number(persona.peekEveryMinutes))))
-      : PEEK_DEFAULT_MINUTES,
-    peekChance: Number.isFinite(Number(persona.peekChance))
-      ? Math.max(0, Math.min(100, Math.round(Number(persona.peekChance))))
-      : PEEK_DEFAULT_CHANCE,
+    peekEveryMinutes: clampPeekMinutes(persona.peekEveryMinutes),
+    peekChance: clampPeekChance(persona.peekChance),
+    peekScheduleEnabled: persona.peekScheduleEnabled === true,
+    peekBusyRanges: typeof persona.peekBusyRanges === 'string' ? persona.peekBusyRanges : PEEK_BUSY_RANGES_DEFAULT,
+    peekBusyEveryMinutes: clampPeekMinutes(persona.peekBusyEveryMinutes, PEEK_BUSY_DEFAULT_MINUTES),
+    peekBusyChance: clampPeekChance(persona.peekBusyChance, PEEK_BUSY_DEFAULT_CHANCE),
+    purposeEnabled: persona.purposeEnabled === true,
+    purposeDailyMax: clampDailyMax(persona.purposeDailyMax),
+    purposeRunOnBusy: persona.purposeRunOnBusy === true,
     revision: persona.revision,
     updatedAt: persona.updatedAt,
     archived: persona.archived === true,
@@ -654,7 +1161,7 @@ function selectNotes(state, query, current = Date.now()) {
  * and the canon notes the character remembers right now. It is registered as
  * runtime context, not as a system-prompt section, because it changes often.
  */
-function compileRuntime(persona, state, query, current = Date.now()) {
+function compileRuntime(persona, state, query, current = Date.now(), memories = []) {
   if (persona === undefined || persona === null) return { text: '', trace: null }
   const blocks = []
   const scene = clean(state?.scene, 1000)
@@ -675,12 +1182,21 @@ function compileRuntime(persona, state, query, current = Date.now()) {
     ].join('\n'))
   }
 
+  if (Array.isArray(memories) && memories.length > 0) {
+    blocks.push([
+      '[Long-term memories]',
+      '这些是你以前记下的、跨会话还在的事。贴题时自然提一句，不要罗列。',
+      ...memories.map((line) => `- ${escapePersonaBody(line)}`),
+    ].join('\n'))
+  }
+
   const trace = {
     at: current,
     query: String(query ?? '').slice(0, 160),
     picked: picked.map((note) => ({ id: note.id, reason: note.reason, hits: note.hits })),
     omitted: omitted.slice(0, 20),
     chars,
+    memories: Array.isArray(memories) ? memories.length : 0,
   }
 
   if (blocks.length === 0) return { text: '', trace }
@@ -700,6 +1216,34 @@ function compileCapsule(persona, state, query, current = Date.now()) {
   return [card, runtime].filter(Boolean).join('\n\n')
 }
 
+function peekLine(persona, current = Date.now()) {
+  const profile = peekProfile(persona, current)
+  const phase = profile.phase === 'busy' ? '高峰' : '空闲'
+  const band = (label, every, chance) => (every <= 0 ? `${label}不看` : `${label}每 ${every} 分钟 / ${chance}%`)
+  const idle = band('空闲', clampPeekMinutes(persona.peekEveryMinutes), clampPeekChance(persona.peekChance))
+  const busy = band(
+    '高峰',
+    clampPeekMinutes(persona.peekBusyEveryMinutes, PEEK_BUSY_DEFAULT_MINUTES),
+    clampPeekChance(persona.peekBusyChance, PEEK_BUSY_DEFAULT_CHANCE),
+  )
+  const split = persona.peekScheduleEnabled === true
+    ? `分档开（${formatBusyRanges(parseBusyRanges(persona.peekBusyRanges)) || '时段未填'}）：${busy}；${idle}`
+    : `分档关：${idle}`
+  const nowText = profile.everyMinutes <= 0
+    ? `此刻算${phase}：这一档不看`
+    : `此刻算${phase}：每 ${profile.everyMinutes} 分钟看一次，${profile.chance}% 搭话`
+  return `${persona.peekEnabled === true ? 'on' : 'off'}｜${split}｜${nowText}`
+}
+
+function purposeLine(persona, state) {
+  if (persona?.purposeEnabled !== true) return 'off'
+  const card = normalizePurposeState(state)
+  const next = card.purposeNextAt > 0
+    ? new Date(card.purposeNextAt).toLocaleString('zh-CN', { hour12: false })
+    : '未排程'
+  return `on｜今日 ${card.purposeCount}/${PURPOSE_DEFAULT_CONFIG.dailyMax}｜下次 ${next}｜安静 ${PURPOSE_DEFAULT_CONFIG.quietStart}-${PURPOSE_DEFAULT_CONFIG.quietEnd}｜开着时窥屏让位`
+}
+
 function showPersonaText(persona, state) {
   const lines = [
     `id: ${persona.id}`,
@@ -713,7 +1257,8 @@ function showPersonaText(persona, state) {
     `injectTags: ${persona.injectTags !== false}`,
     `useActions: ${persona.useActions === true}`,
     `useMemes: ${persona.useMemes === true} (frequency ${Number.isFinite(Number(persona.memeFrequency)) ? Math.round(Number(persona.memeFrequency)) : MEME_FREQUENCY_DEFAULT}%)`,
-    `peek: ${persona.peekEnabled === true ? 'on' : 'off'} (every ${Number(persona.peekEveryMinutes) || PEEK_DEFAULT_MINUTES} min, ${Number(persona.peekChance) || 0}% to speak)`,
+    `peek: ${peekLine(persona)}`,
+    `purpose: ${purposeLine(persona, state)}`,
     '',
     `tagCode:\n${persona.tagCode || deriveTagCode(persona) || '(auto: 卡片内容太少，没有可生成的锚点)'}`,
     '',
@@ -798,6 +1343,7 @@ class PersonaStore {
     this.personas = domain.table('personas')
     this.bindings = domain.table('bindings')
     this.states = domain.table('states')
+    this.memories = domain.table('memories')
     this.traces = new Map()
     this.queryCache = new Map()
   }
@@ -915,6 +1461,197 @@ class PersonaStore {
     return next
   }
 
+  /** 记忆卡（MVP）：per-persona 的长期记忆，跨会话累积，跟会话正史分开放。 */
+  listMemories(personaId) {
+    const stored = this.memories.get(String(personaId))
+    const records = Array.isArray(stored?.records) ? stored.records : []
+    return records.map((record) => normalizeMemoryRecord(record)).filter((record) => record !== null)
+  }
+
+  async putMemories(personaId, records) {
+    // 变更前先留一份当天快照：误删/误合并还能捞回来。
+    await this.snapshotMemories(personaId).catch((error) => {
+      this.ctx.logger?.warn?.('dsh-persona: memory snapshot failed: %o', error)
+    })
+    const next = {
+      personaId: String(personaId),
+      records: trimMemories(mergeDuplicateMemories(records)),
+      updatedAt: now(),
+    }
+    await this.memories.put(String(personaId), next)
+    return next
+  }
+
+  async rememberLong(personaId, input = {}, source = '') {
+    const records = this.listMemories(personaId)
+    const record = normalizeMemoryRecord({
+      text: input.text,
+      kind: input.kind,
+      importance: input.importance,
+      pinned: input.pinned === true,
+      firstMet: input.firstMet === true,
+      owner: typeof input.owner === 'string' ? input.owner : '',
+      tags: input.tags,
+      source,
+      createdAt: now(),
+      lastSeenAt: now(),
+    })
+    if (record === null) throw new Error('要记的内容不能为空。')
+    const kept = records.filter((item) => item.text !== record.text)
+    kept.push(record)
+    const next = await this.putMemories(personaId, kept)
+    return { record, count: next.records.length }
+  }
+
+  async forgetLong(personaId, ref) {
+    const records = this.listMemories(personaId)
+    const key = String(ref ?? '').trim()
+    if (key === '') throw new Error('要删哪条？给 id 或原文片段。')
+    const index = records.findIndex((item) => item.id === key || item.text.includes(key))
+    if (index === -1) throw new Error('没找到这条记忆。')
+    const [removed] = records.splice(index, 1)
+    const next = await this.putMemories(personaId, records)
+    return { removed, count: next.records.length }
+  }
+
+  selectMemoriesFor(personaId, query, current = now(), owner = '') {
+    return selectMemories(this.listMemories(personaId), query, current, { owner })
+  }
+
+  /** 目的机制的配额按「卡」算，跨会话共享：同一张卡一天就这么多，不会六个会话各算一份。 */
+  getPurposeBudget(personaId, at = now()) {
+    const entry = this.memories.get(`${String(personaId)}#purpose`)
+    const day = localDayKey(at)
+    if (entry === null || entry === undefined || typeof entry !== 'object' || entry.day !== day) {
+      return { day, count: 0, lastAt: 0 }
+    }
+    return {
+      day,
+      count: clampInt(entry.count, 0, 0, 999),
+      lastAt: Number.isFinite(Number(entry.lastAt)) ? Number(entry.lastAt) : 0,
+    }
+  }
+
+  async bumpPurposeBudget(personaId, at = now()) {
+    const current = this.getPurposeBudget(personaId, at)
+    const next = { day: current.day, count: current.count + 1, lastAt: at }
+    await this.memories.put(`${String(personaId)}#purpose`, next)
+    return next
+  }
+
+  /** 种子（purpose P1）：存在 memories 表的独立 key 下，不跟记忆混在一起。 */
+  listSeeds(personaId) {
+    const entry = this.memories.get(`${String(personaId)}#seed`)
+    const records = Array.isArray(entry?.records) ? entry.records : []
+    return records.map((seed) => normalizeSeed(seed)).filter((seed) => seed !== null)
+  }
+
+  async putSeeds(personaId, seeds) {
+    const next = { kind: 'seed', personaId: String(personaId), records: seeds.slice(-MAX_SEEDS) }
+    await this.memories.put(`${String(personaId)}#seed`, next)
+    return next
+  }
+
+  /** 从素材里挖种子，近似重复的丢掉。 */
+  async harvestSeeds(personaId, materials, at = now()) {
+    const existing = this.listSeeds(personaId)
+    const fresh = []
+    for (const item of Array.isArray(materials) ? materials : []) {
+      for (const seed of mineSeeds(item.text, at)) {
+        const duplicate = existing.some((kept) => kept.kind === seed.kind && memorySimilarity(kept.text, seed.text) > 0.6)
+          || fresh.some((kept) => kept.kind === seed.kind && memorySimilarity(kept.text, seed.text) > 0.6)
+        if (duplicate) continue
+        fresh.push({ ...seed, id: `s_${randomUUID()}`, createdAt: at, askedAt: 0, askedCount: 0 })
+      }
+    }
+    if (fresh.length === 0) return { added: 0, total: existing.length }
+    const next = [...existing, ...fresh].slice(-MAX_SEEDS)
+    await this.putSeeds(personaId, next)
+    return { added: fresh.length, total: next.length }
+  }
+
+  /** 标记这几颗种子问过了，冷却期内不再重复。 */
+  async markSeedsAsked(personaId, ids, at = now()) {
+    if (!Array.isArray(ids) || ids.length === 0) return
+    const seeds = this.listSeeds(personaId).map((seed) =>
+      ids.includes(seed.id) ? { ...seed, askedAt: at, askedCount: seed.askedCount + 1 } : seed
+    )
+    await this.putSeeds(personaId, seeds)
+  }
+
+  async forgetSeed(personaId, ref) {
+    const seeds = this.listSeeds(personaId)
+    const key = String(ref ?? '').trim()
+    const index = seeds.findIndex((seed) => seed.id === key || seed.text.includes(key))
+    if (index === -1) throw new Error('没找到这件事。')
+    const [removed] = seeds.splice(index, 1)
+    await this.putSeeds(personaId, seeds)
+    return removed
+  }
+
+  /** 每天一份快照，最多留 7 份。同一天已经存过就跳过。 */
+  async snapshotMemories(personaId, at = now()) {
+    const key = String(personaId)
+    const day = localDayKey(at)
+    const id = `${key}#backup#${day}`
+    const existing = this.memories.get(id)
+    if (existing !== null && existing !== undefined) return null
+    const records = this.listMemories(key)
+    if (records.length === 0) return null
+    const entry = { personaId: key, day, at, records, kind: 'backup' }
+    await this.memories.put(id, entry)
+    let days = []
+    try {
+      days = [...this.memories.keys()].filter((item) => item.startsWith(`${key}#backup#`)).sort()
+    } catch {
+      days = []
+    }
+    for (const stale of days.slice(0, Math.max(0, days.length - MAX_MEMORY_BACKUPS))) {
+      await this.memories.delete(stale)
+    }
+    return entry
+  }
+
+  listMemoryBackups(personaId) {
+    const key = String(personaId)
+    const prefix = `${key}#backup#`
+    try {
+      return [...this.memories.keys()]
+        .filter((item) => item.startsWith(prefix))
+        .map((item) => this.memories.get(item))
+        .filter((entry) => entry !== null && entry !== undefined && typeof entry === 'object')
+        .sort((a, b) => String(b.day).localeCompare(String(a.day)))
+        .map((entry) => ({
+          day: entry.day,
+          at: entry.at,
+          count: Array.isArray(entry.records) ? entry.records.length : 0,
+        }))
+    } catch {
+      return []
+    }
+  }
+
+  async restoreMemoryBackup(personaId, day) {
+    const key = String(personaId)
+    const entry = this.memories.get(`${key}#backup#${String(day ?? '')}`)
+    if (entry === null || typeof entry !== 'object') throw new Error('没找到这一天的快照。')
+    const records = Array.isArray(entry.records) ? entry.records : []
+    const next = await this.putMemories(key, records)
+    return { count: next.records.length, day: entry.day }
+  }
+
+  async setMemoryPinned(personaId, ref, pinned = true) {
+    const records = this.listMemories(personaId)
+    const key = String(ref ?? '').trim()
+    if (key === '') throw new Error('要给哪条置顶？给 id 或原文片段。')
+    const index = records.findIndex((item) => item.id === key || item.text.includes(key))
+    if (index === -1) throw new Error('没找到这条记忆。')
+    const record = { ...records[index], pinned: pinned === true, lastSeenAt: now() }
+    records[index] = record
+    const next = await this.putMemories(personaId, records)
+    return { record, count: next.records.length }
+  }
+
   async usePersona(sessionId, ref) {
     const persona = this.requirePersona(ref)
     if (persona.archived === true) throw new Error(`人格「${persona.name}」已归档，不能绑定。`)
@@ -925,6 +1662,8 @@ class PersonaStore {
       createdAt: previous?.createdAt ?? now(),
       updatedAt: now(),
     }
+    // 窥屏是“这个会话要不要”的选择，换人格不该把它重置掉。
+    if (typeof previous?.peek === 'boolean') binding.peek = previous.peek
     await this.bindings.put(sessionId, binding)
     const existingState = this.states.get(stateKey(sessionId, persona.id))
     if (existingState === null || typeof existingState !== 'object') {
@@ -935,6 +1674,36 @@ class PersonaStore {
 
   async off(sessionId) {
     await this.bindings.delete(sessionId)
+  }
+
+  /** 窥屏在这个会话的状态：会话自己的选择、最终生效值、卡片默认值。 */
+  peekOn(sessionId) {
+    const active = this.active(sessionId)
+    if (active === null) return null
+    const override = typeof active.binding.peek === 'boolean' ? active.binding.peek : null
+    return {
+      override,
+      effective: peekSwitch(active.binding, active.persona),
+      card: active.persona.peekEnabled === true,
+      profile: peekProfile(active.persona),
+    }
+  }
+
+  /** 只改这个会话的窥屏开关；enabled 传 null 表示回到“跟随人格卡”。 */
+  async setPeek(sessionId, enabled) {
+    const active = this.active(sessionId)
+    if (active === null) throw new Error('当前会话还没有绑定人格，没法单独设置窥屏。')
+    const binding = { ...active.binding, sessionId, personaId: active.persona.id, updatedAt: now() }
+    if (enabled === true || enabled === false) binding.peek = enabled
+    else delete binding.peek
+    await this.bindings.put(sessionId, binding)
+    return {
+      binding,
+      override: typeof binding.peek === 'boolean' ? binding.peek : null,
+      effective: peekSwitch(binding, active.persona),
+      card: active.persona.peekEnabled === true,
+      profile: peekProfile(active.persona),
+    }
   }
 
   async updateState(sessionId, patch) {
@@ -1041,7 +1810,10 @@ class PersonaStore {
     if (active === null) return ''
     const state = this.getState(sessionId, active.persona.id)
     const query = this.lastUserText(this.session(sessionId))
-    const runtime = compileRuntime(active.persona, state, query)
+    const session = this.session(sessionId)
+    const owner = ownerOfSession(session)
+    const memories = this.selectMemoriesFor(active.persona.id, query, Date.now(), owner).picked.map((item) => item.line)
+    const runtime = compileRuntime(active.persona, state, query, Date.now(), memories)
     this.traces.set(sessionId, runtime.trace)
     return runtime.text
   }
@@ -1059,6 +1831,7 @@ class PersonaStore {
       persona: active.persona,
       binding: active.binding,
       state,
+      peek: this.peekOn(sessionId),
       card,
       runtime: runtime.text,
       trace: runtime.trace,
@@ -1274,6 +2047,73 @@ function peekPrompt(persona, seen) {
   ].filter((line) => line !== '').join('\n')
 }
 
+/** 取会话最近消息当素材：只留双方文本，去掉太短的，限条数。 */
+function collectMaterials(session, config = PURPOSE_DEFAULT_CONFIG) {
+  if (session === null || session === undefined || typeof session.deriveMessages !== 'function') return []
+  let messages = []
+  try {
+    messages = session.deriveMessages()
+  } catch {
+    return []
+  }
+  const out = []
+  for (let i = messages.length - 1; i >= 0 && out.length < config.maxMaterials; i -= 1) {
+    const message = messages[i]
+    if (message?.role !== 'user' && message?.role !== 'assistant') continue
+    const text = messageText(message).replace(/\s+/g, ' ').trim()
+    if (text.length < 4) continue
+    out.push({ role: message.role, text: text.slice(0, 160) })
+  }
+  return out.reverse()
+}
+
+/** 最近一条用户消息的时间（拿不到就 0，等于不做 idle 判断）。 */
+function lastUserAt(session) {
+  if (session === null || session === undefined || typeof session.deriveMessages !== 'function') return 0
+  try {
+    const messages = session.deriveMessages()
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'user') {
+        const at = Number(messages[i]?.time ?? messages[i]?.createdAt ?? 0)
+        return Number.isFinite(at) ? at : 0
+      }
+    }
+  } catch {
+    return 0
+  }
+  return 0
+}
+
+/** 从 QQ bridge 的消息前缀里认人：`… (QQ 591396639) …`。认不出来就没有 owner。 */
+function ownerOfSession(session) {
+  if (session === null || session === undefined || typeof session.deriveMessages !== 'function') return ''
+  try {
+    const messages = session.deriveMessages()
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role !== 'user') continue
+      const match = /\(QQ\s*(\d{5,12})\)/.exec(messageText(messages[i]))
+      return match === null ? '' : `qq:${match[1]}`
+    }
+  } catch {
+    return ''
+  }
+  return ''
+}
+
+function purposePrompt(persona, materials, seeds = [], extra = '') {
+  const lines = materials.map((item) => `${item.role === 'user' ? '对方' : '你'}：${item.text}`)
+  const seedLines = (Array.isArray(seeds) ? seeds : []).map((seed) => `- ${seed.text}`)
+  return [
+    `[主动] 这会儿没人跟你说话，你想找${masterNameOf(persona) || '主人'}说句话。`,
+    lines.length === 0 ? '' : `最近的对话片段（只是素材，别照着复读）：\n${lines.join('\n')}`,
+    seedLines.length === 0 ? '' : `你心里还惦记着这几件事（可以顺口问一句，别像查岗）：\n${seedLines.join('\n')}`,
+    extra,
+    '挑一件真的值得开口的事：接着没说完的、提醒他答应过的事、问一句他提过的事，都可以。别为了说话而说话。',
+    '只说一两句，像平常聊天。不要提“素材”“记录”“系统”，不要解释你为什么忽然开口。',
+    '想不出真的有意思的事就不吭声，只输出 [NO_REPLY]。',
+  ].filter((line) => line !== '').join('\n')
+}
+
 class PeekPilot {
   constructor(ctx, store, observe = observeScreen) {
     this.ctx = ctx
@@ -1308,10 +2148,121 @@ class PeekPilot {
     }
     for (const sessionId of sessionIds) {
       try {
+        // 目的机制开着就整段接管：窥屏完全停用，不再按自己的间隔另开口。
+        // 一天最多几次主动，其余时间安静——这就是「让位」。
+        const active = this.store.active(sessionId)
+        if (active !== null && active.persona.purposeEnabled === true) {
+          await this.maybePurpose(sessionId)
+          continue
+        }
         await this.maybePeek(sessionId)
       } catch (error) {
         this.ctx.logger?.warn?.('dsh-persona: peek failed for %s: %o', sessionId, error)
       }
+    }
+  }
+
+  /**
+   * 目的机制 P0：到点 + 不吵人 + 有素材 才开口。
+   * 返回 true 表示这个会话这一轮由它接管，窥屏就别再看了。
+   */
+  async maybePurpose(sessionId) {
+    if (this.inFlight.has(sessionId)) return false
+    if (this.isArchived(sessionId)) return false
+    const active = this.store.active(sessionId)
+    if (active === null) return false
+    if (active.persona.purposeEnabled !== true) return false
+    const config = PURPOSE_DEFAULT_CONFIG
+    const session = this.store.session(sessionId)
+    const state = this.store.getState(sessionId, active.persona.id)
+    const materials = collectMaterials(session, config)
+    const budget = this.store.getPurposeBudget(active.persona.id, now())
+    const profile = peekProfile(active.persona, now())
+    const verdict = evaluatePurposeTick({
+      now: now(),
+      config,
+      state,
+      lastMasterAt: lastUserAt(session),
+      materialCount: materials.length,
+      dailyCount: budget.count,
+      lastFireAt: budget.lastAt,
+      busy: profile.phase === 'busy',
+      busyUntil: busyUntilAt(profile.ranges, now()),
+      dailyMax: active.persona.purposeDailyMax,
+      allowBusy: active.persona.purposeRunOnBusy === true,
+    })
+    if (verdict.fire !== true) {
+      if (verdict.nextAt !== undefined) {
+        await this.store.putState(sessionId, active.persona.id, {
+          ...state,
+          purposeNextAt: verdict.nextAt,
+          purposeDay: localDayKey(now()),
+        })
+      }
+      return false
+    }
+    let agent = this.agentFor(sessionId)
+    let resumed = false
+    if (agent === undefined) {
+      try {
+        agent = await this.resumeAgent(sessionId)
+        resumed = true
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: purpose resume failed for %s: %o', sessionId, error)
+        return false
+      }
+    }
+    if (agent.status === 'running') {
+      if (resumed) this.scheduleRelease(sessionId)
+      return false
+    }
+    this.inFlight.add(sessionId)
+    try {
+      const at = now()
+      const card = normalizePurposeState(state, at)
+      const history = [...card.purposeHistory, materials[materials.length - 1]?.text ?? ''].slice(-config.historyLimit)
+      // 基于 state 展开：normalize 出来的 card 只有 purpose 字段，直接铺它会连
+      // scene / mood / notes 一起冲掉。
+      await this.store.putState(sessionId, active.persona.id, {
+        ...state,
+        purposeLastAt: at,
+        purposeCount: card.purposeCount + 1,
+        purposeAttempts: card.purposeAttempts + 1,
+        purposeNextAt: planNextFire({ now: at, config }),
+        purposeHistory: history,
+      })
+      if (resumed) {
+        const entry = this.resumed.get(String(sessionId))
+        if (entry !== undefined) {
+          entry.watchdog = setTimeout(() => {
+            entry.watchdog = null
+            this.releaseResumed(sessionId)
+          }, PEEK_RESUME_WATCHDOG_MS)
+          entry.watchdog.unref?.()
+        }
+      }
+      // P1：先把素材里的「想做/约了时间/没兑现」挖成种子，再挑到期该问的。
+      let seeds = []
+      try {
+        await this.store.harvestSeeds(active.persona.id, materials, at)
+        seeds = pickSeeds(this.store.listSeeds(active.persona.id), at)
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: seed harvest failed: %o', error)
+      }
+      agent.followup({
+        id: `purpose_${randomUUID()}`,
+        role: 'user',
+        content: [{ type: 'text', text: purposePrompt(active.persona, materials, seeds) }],
+        source: { kind: 'user' },
+      })
+      if (seeds.length > 0) {
+        void this.store.markSeedsAsked(active.persona.id, seeds.map((seed) => seed.id), at).catch(() => {})
+      }
+      // 配额记在卡上：同一张卡换会话接着聊也不会多出一份额度。
+      await this.store.bumpPurposeBudget(active.persona.id, at).catch(() => {})
+      return true
+    } finally {
+      this.inFlight.delete(sessionId)
     }
   }
 
@@ -1408,9 +2359,13 @@ class PeekPilot {
     const active = this.store.active(sessionId)
     if (active === null) return
     const persona = active.persona
-    if (persona.peekEnabled !== true) return
-    const every = Math.max(1, Math.min(MAX_PEEK_MINUTES, Math.round(Number(persona.peekEveryMinutes) || PEEK_DEFAULT_MINUTES)))
-    const chance = Math.max(0, Math.min(100, Math.round(Number(persona.peekChance) || 0)))
+    // 会话自己选过就听会话的，没选过跟人格卡默认值。
+    if (!peekSwitch(active.binding, persona)) return
+    // 高峰 / 空闲各用一组间隔和概率；这一档间隔设 0 = 完全不看（不截图、不叫醒）。
+    const profile = peekProfile(persona)
+    if (profile.everyMinutes <= 0) return
+    const every = profile.everyMinutes
+    const chance = profile.chance
     const state = this.store.getState(sessionId, persona.id)
     if (now() - (Number(state.peekAt) || 0) < every * 60_000) return
     let agent = this.agentFor(sessionId)
@@ -1668,6 +2623,10 @@ function toolPatch(args) {  const patch = {}
   if (args.peekEnabled !== undefined) patch.peekEnabled = args.peekEnabled
   if (args.peekEveryMinutes !== undefined) patch.peekEveryMinutes = args.peekEveryMinutes
   if (args.peekChance !== undefined) patch.peekChance = args.peekChance
+  if (args.peekScheduleEnabled !== undefined) patch.peekScheduleEnabled = args.peekScheduleEnabled
+  if (args.peekBusyRanges !== undefined) patch.peekBusyRanges = args.peekBusyRanges
+  if (args.peekBusyEveryMinutes !== undefined) patch.peekBusyEveryMinutes = args.peekBusyEveryMinutes
+  if (args.peekBusyChance !== undefined) patch.peekBusyChance = args.peekBusyChance
   if (args.archived !== undefined) patch.archived = args.archived
   return patch
 }
@@ -1743,14 +2702,14 @@ export async function apply(ctx) {
 
   const personaTool = {
     name: 'persona',
-    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Each card is headed by a compact 【PERSONA_LOAD】 tag block (auto-derived from the fields unless tagCode is set): write tags as one anchor per line, never as prose. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
+    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Each card is headed by a compact 【PERSONA_LOAD】 tag block (auto-derived from the fields unless tagCode is set): write tags as one anchor per line, never as prose. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), peek to turn the periodic screen-check on or off for this session only (the card\'s peekEnabled is just the default for sessions that never chose), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich'],
+          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich', 'peek', 'memory', 'memorize', 'forget-memory', 'seeds', 'seed-forget'],
           description: 'The operation to perform.',
         },
         id: { type: 'string', description: 'Persona id or exact name. Omit to address the active persona, except for use.' },
@@ -1762,9 +2721,14 @@ export async function apply(ctx) {
         useActions: { type: 'boolean', description: 'Whether replies may include a short action beat in full-width brackets, e.g. （搬小板凳）. Default false.' },
         useMemes: { type: 'boolean', description: 'Whether the character may send memes/stickers through the send_meme tool. Default false.' },
         memeFrequency: { type: 'number', description: 'Sticker rate as a percentage of replies, 0-100 (default 30). Only used when useMemes is true.' },
-        peekEnabled: { type: 'boolean', description: 'Let the persona peek at the master\'s screen on a timer and sometimes start the conversation by itself. Default false; only works on Windows.' },
-        peekEveryMinutes: { type: 'number', description: 'How often the peek timer runs, 1-240 minutes (default 15).' },
-        peekChance: { type: 'number', description: 'Chance (percent) that a peek actually starts a conversation, 0-100 (default 30).' },
+        peekEnabled: { type: 'boolean', description: 'Card default: let the persona peek at the master\'s screen on a timer. Each session can override it with action "peek". Default false; only works on Windows.' },
+        peekEveryMinutes: { type: 'number', description: 'How often the peek timer runs, 0-240 minutes (default 15). 0 means this band never looks. Used as the idle band when peekScheduleEnabled is true.' },
+        peekChance: { type: 'number', description: 'Chance (percent) that a peek actually starts a conversation, 0-100 (default 30). Idle band chance when peekScheduleEnabled is true.' },
+        peekScheduleEnabled: { type: 'boolean', description: 'Split peek between a busy band and an idle band. When true, peekBusyRanges decides which band applies, and peekBusyEveryMinutes/peekBusyChance replace peekEveryMinutes/peekChance inside those hours. Default false.' },
+        peekBusyRanges: { type: 'string', description: 'Busy hours in local time, comma separated, e.g. "09:00-12:00, 14:00-18:00". Cross-midnight ranges (22:00-02:00) are supported. Empty means no busy band.' },
+        peekBusyEveryMinutes: { type: 'number', description: 'Busy-band peek interval, 0-240 minutes (default 5); 0 pauses peeking during busy hours.' },
+        peekBusyChance: { type: 'number', description: 'Busy-band chance to start a conversation, 0-100 (default 60).' },
+        enabled: { type: 'boolean', description: 'For peek: turn the periodic screen-check on/off for this session only. Omit to fall back to the card default.' },
         identity: { type: 'string', description: 'Who they are: role, age/species, and the one-line anchor of their self-image.' },
         traits: { type: 'string', description: 'Personality traits: temperament, contradictions, how they react under pressure.' },
         voice: { type: 'string', description: 'Tone, rhythm, vocabulary, verbal tics, forms of address, avoid list.' },
@@ -1783,6 +2747,12 @@ export async function apply(ctx) {
         maxReplyChars: { type: 'number', description: 'Maximum characters for one visible reply. 0 means unlimited; typical values are 200-800.' },
         note: { type: 'string', description: 'For remember: the canon fact to add to this session.' },
         noteId: { type: 'string', description: 'For forget/pin: the note id (or a unique fragment of its text).' },
+        memory: { type: 'string', description: "For memorize: one sentence to keep in the card's long-term memory (cross-session). For forget-memory: an id or text fragment." },
+        memoryId: { type: 'string', description: 'For forget-memory: the memory id (or a unique fragment of its text).' },
+        importance: { type: 'number', description: 'For memorize: 0-5, how much this matters. Higher importance decays slower; default 3.' },
+        kind: { type: 'string', description: 'For memorize: fact | preference | plan | event. Default fact.' },
+        firstMet: { type: 'boolean', description: 'For memorize: mark this as the first meeting; it never decays and always ranks first.' },
+        owner: { type: 'string', description: 'For memorize: whose memory this is (e.g. qq:591396639). Omit to auto-detect from the message prefix of the current turn.' },
         pinned: { type: 'boolean', description: 'For remember/pin: keep this fact in the turn-by-turn runtime context.' },
         scene: { type: 'string', description: 'For state: current place, time, and situation.' },
         mood: { type: 'string', description: 'For state: current emotional temperature.' },
@@ -1878,6 +2848,81 @@ export async function apply(ctx) {
         return { ok: true, message: formatNotesText(state), state }
       }
 
+      if (action === 'seeds') {
+        const { persona } = store.requireActive(sessionId)
+        const seeds = store.listSeeds(persona.id)
+        if (seeds.length === 0) return { ok: true, message: '这张卡还没惦记着什么。' }
+        const lines = seeds
+          .sort((a, b) => a.dueAt - b.dueAt)
+          .map((seed) => {
+            const due = new Date(seed.dueAt).toLocaleString('zh-CN', {
+              hour12: false,
+              month: '2-digit',
+              day: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit',
+            })
+            const asked = seed.askedCount > 0 ? ` · 问过 ${seed.askedCount} 次` : ' · 还没问过'
+            return `- [${seed.id}] ${seed.kind}｜到期 ${due}${asked}\n  ${seed.text}`
+          })
+          .join('\n')
+        return { ok: true, message: `惦记着 ${seeds.length} 件事：\n${lines}` }
+      }
+
+      if (action === 'seed-forget') {
+        const { persona } = store.requireActive(sessionId)
+        const ref = String(args.memoryId ?? args.memory ?? '').trim()
+        if (ref === '') throw new Error('要删哪一件？给 id 或原文片段。')
+        const removed = await store.forgetSeed(persona.id, ref)
+        return { ok: true, message: `不再惦记「${removed.text.slice(0, 60)}」了。` }
+      }
+
+      if (action === 'memory') {
+        const { persona } = store.requireActive(sessionId)
+        const records = store.listMemories(persona.id)
+        if (records.length === 0) return { ok: true, message: '这张卡还没有长期记忆。' }
+        const lines = records
+          .map((record) => {
+            const clarity = Math.round(memoryClarity(record) * 100)
+            const when = formatNoteTime(record.createdAt)
+            return `- [${record.id}] ${when} · 重要度 ${record.importance} · 鲜活 ${clarity}%${record.pinned ? ' · 📌' : ''}${record.firstMet ? ' · 初遇' : ''}\n  ${record.text.slice(0, 120)}`
+          })
+          .join('\n')
+        return { ok: true, message: `长期记忆（${records.length} 条）：\n${lines}` }
+      }
+
+      if (action === 'memorize') {
+        const { persona } = store.requireActive(sessionId)
+        const text = String(args.memory ?? args.note ?? '').trim()
+        if (text === '') throw new Error('要记什么？用 memory 传一句话。')
+        const { record, count } = await store.rememberLong(persona.id, {
+          text,
+          kind: args.kind,
+          importance: args.importance,
+          pinned: args.pinned === true,
+          firstMet: args.firstMet === true,
+          owner: typeof args.owner === 'string' && args.owner !== ''
+            ? args.owner
+            : ownerOfSession(store.session(sessionId)),
+          tags: args.tags,
+        }, sessionId)
+        return {
+          ok: true,
+          message: `已写入「${persona.name}」的长期记忆（共 ${count} 条，id: ${record.id}，重要度 ${record.importance}）。`,
+          capsule: store.compileForSession(sessionId),
+        }
+      }
+
+      if (action === 'forget-memory') {
+        const { persona } = store.requireActive(sessionId)
+        const { removed, count } = await store.forgetLong(persona.id, args.memoryId ?? args.memory)
+        return {
+          ok: true,
+          message: `已删除一条长期记忆：「${removed.text.slice(0, 60)}」。剩余 ${count} 条。`,
+          capsule: store.compileForSession(sessionId),
+        }
+      }
+
       if (action === 'forget') {
         const { state, removed } = await store.forget(sessionId, args.noteId ?? args.note)
         return {
@@ -1926,6 +2971,22 @@ export async function apply(ctx) {
         return { ok: true, message: '已关闭当前会话的人格，恢复默认助手。' }
       }
 
+      if (action === 'peek') {
+        const enabled = args.enabled === true ? true : args.enabled === false ? false : null
+        const next = await store.setPeek(sessionId, enabled)
+        const mode = enabled === null ? '跟随人格卡默认值' : enabled ? '开' : '关'
+        return {
+          ok: true,
+          message: [
+            `本会话窥屏已设为「${mode}」，当前生效：${next.effective ? '开' : '关'}。`,
+            next.effective ? '只在 Windows 上、会话空闲时才会看一眼。' : '',
+            next.effective ? peekLine(store.active(sessionId).persona) : '',
+            enabled === null ? `人格卡默认是${next.card ? '开' : '关'}。` : '',
+          ].filter(Boolean).join(''),
+          persona: summaryOf(store.active(sessionId).persona),
+        }
+      }
+
       if (action === 'enrich') {
         const active = store.active(sessionId)
         const ref = args.id ?? active?.persona?.id
@@ -1958,7 +3019,7 @@ export async function apply(ctx) {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'persona',
       description: '查看或切换当前会话的人格',
-      input: { hint: '[list|show [name]|use <name>|new <name>|off|remember <text>|notes|forget <id>|pin <id>|enrich]' },
+      input: { hint: '[list|show [name]|use <name>|new <name>|off|remember <text>|notes|forget <id>|pin <id>|enrich|peek [on|off|auto]]' },
       handler: async ({ agent, rawInput }) => {
         const raw = String(rawInput ?? '').trim()
         const space = raw.search(/\s/)
@@ -1994,6 +3055,16 @@ export async function apply(ctx) {
             await store.off(agent.id)
             return { kind: 'success', text: '已关闭当前会话的人格。' }
           }
+          if (verb === 'peek') {
+            const arg2 = arg.toLowerCase()
+            const enabled = arg2 === 'on' ? true : arg2 === 'off' ? false : arg2 === '' || arg2 === 'auto' ? null : undefined
+            if (enabled === undefined) return { kind: 'error', text: '用法：/persona peek [on|off|auto]' }
+            const next = await store.setPeek(agent.id, enabled)
+            return {
+              kind: 'success',
+              text: `本会话窥屏：${enabled === null ? '跟随人格卡' : enabled ? '开' : '关'}（当前生效：${next.effective ? '开' : '关'}）。`,
+            }
+          }
           if (verb === 'remember') {
             if (arg === '') return { kind: 'error', text: '用法：/persona remember <要记住的事>' }
             const { state, note } = await store.remember(agent.id, arg, { pinned: false })
@@ -2024,7 +3095,7 @@ export async function apply(ctx) {
                 : '字段已经比较完整，没有可补的。',
             }
           }
-          return { kind: 'error', text: '用法：/persona [list|show [name]|use <name>|new <name>|off|remember <text>|notes|forget <id>|pin <id>|enrich]' }
+          return { kind: 'error', text: '用法：/persona [list|show [name]|use <name>|new <name>|off|remember <text>|notes|forget <id>|pin <id>|enrich|peek [on|off|auto]]' }
         } catch (error) {
           return { kind: 'error', text: errorText(error) }
         }
@@ -2071,6 +3142,85 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: true, persona })
             return
           }
+          if (op === 'memory-list') {
+            const persona = store.requirePersona(body.id)
+            const records = store.listMemories(persona.id)
+            sendJson(res, 200, {
+              ok: true,
+              memories: records.map((record) => ({
+                id: record.id,
+                text: record.text,
+                kind: record.kind,
+                importance: record.importance,
+                pinned: record.pinned,
+                firstMet: record.firstMet,
+                owner: record.owner,
+                mergedCount: record.mergedCount,
+                createdAt: record.createdAt,
+                clarity: memoryClarity(record),
+              })),
+            })
+            return
+          }
+          if (op === 'memory-add') {
+            const persona = store.requirePersona(body.id)
+            const { record, count } = await store.rememberLong(persona.id, {
+              text: body.text,
+              kind: body.kind,
+              importance: body.importance,
+              pinned: body.pinned === true,
+            }, sessionId)
+            sendJson(res, 200, { ok: true, memory: record, count })
+            return
+          }
+          if (op === 'seeds-list') {
+            const persona = store.requirePersona(body.id)
+            sendJson(res, 200, {
+              ok: true,
+              seeds: store.listSeeds(persona.id).sort((a, b) => a.dueAt - b.dueAt),
+            })
+            return
+          }
+          if (op === 'seed-forget') {
+            const persona = store.requirePersona(body.id)
+            const removed = await store.forgetSeed(persona.id, body.seedId)
+            sendJson(res, 200, { ok: true, removed: { id: removed.id, text: removed.text }, count: store.listSeeds(persona.id).length })
+            return
+          }
+          if (op === 'memory-backups') {
+            const persona = store.requirePersona(body.id)
+            sendJson(res, 200, { ok: true, backups: store.listMemoryBackups(persona.id) })
+            return
+          }
+          if (op === 'memory-restore') {
+            const persona = store.requirePersona(body.id)
+            const result = await store.restoreMemoryBackup(persona.id, body.day)
+            sendJson(res, 200, { ok: true, ...result })
+            return
+          }
+          if (op === 'memory-prune') {
+            const persona = store.requirePersona(body.id)
+            const limit = Number.isFinite(Number(body.below)) ? Math.max(0, Math.min(1, Number(body.below))) : 0.15
+            const records = store.listMemories(persona.id)
+            const kept = records.filter((record) =>
+              record.pinned === true || record.firstMet === true || memoryClarity(record) >= limit
+            )
+            await store.putMemories(persona.id, kept)
+            sendJson(res, 200, { ok: true, removed: records.length - kept.length, count: kept.length })
+            return
+          }
+          if (op === 'memory-forget') {
+            const persona = store.requirePersona(body.id)
+            const { removed, count } = await store.forgetLong(persona.id, body.memoryId)
+            sendJson(res, 200, { ok: true, removed: { id: removed.id, text: removed.text }, count })
+            return
+          }
+          if (op === 'memory-pin') {
+            const persona = store.requirePersona(body.id)
+            const { record, count } = await store.setMemoryPinned(persona.id, body.memoryId, body.pinned !== false)
+            sendJson(res, 200, { ok: true, pinned: record.pinned, count })
+            return
+          }
           if (op === 'preview') {
             const preview = store.preview(body.id, sessionId)
             sendJson(res, 200, { ok: true, ...preview })
@@ -2102,6 +3252,13 @@ export async function apply(ctx) {
             if (sessionId === '') throw new Error('off 需要 sessionId。')
             await store.off(sessionId)
             sendJson(res, 200, { ok: true, active: null })
+            return
+          }
+          if (op === 'peek') {
+            if (sessionId === '') throw new Error('peek 需要 sessionId。')
+            const enabled = body.enabled === true ? true : body.enabled === false ? false : null
+            const next = await store.setPeek(sessionId, enabled)
+            sendJson(res, 200, { ok: true, peek: next, active: store.activeSnapshot(sessionId) })
             return
           }
           if (op === 'state') {
@@ -2196,6 +3353,40 @@ export const __test = {
   deriveTagCode,
   tagBlockOf,
   peekPrompt,
+  peekSwitch,
+  peekProfile,
+  busyUntilAt,
+  peekLine,
+  purposePrompt,
+  purposeLine,
+  collectMaterials,
+  lastUserAt,
+  evaluatePurposeTick,
+  planNextFire,
+  inQuietHours,
+  quietEndAfter,
+  normalizePurposeState,
+  localDayKey,
+  normalizeMemoryRecord,
+  memoryClarity,
+  memoryScore,
+  queryHits,
+  selectMemories,
+  trimMemories,
+  mineSeeds,
+  pickSeeds,
+  seedDueAt,
+  normalizeSeed,
+  mergeDuplicateMemories,
+  memorySimilarity,
+  memoryTokens,
+  ownerOfSession,
+  MAX_MEMORIES,
+  MAX_MEMORY_ITEMS,
+  MAX_MEMORY_CHARS,
+  PURPOSE_DEFAULT_CONFIG,
+  parseBusyRanges,
+  formatBusyRanges,
   observeScreen,
   PeekPilot,
   jsonSafe,
