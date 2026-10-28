@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -312,16 +312,15 @@ const MAX_MEMORY_CHARS = 600
 const MAX_MEMORY_BACKUPS = 7
 
 /**
- * 种子（purpose P1）：从对话里挖「想做 / 约了时间 / 没兑现的承诺」，
+ * 种子（purpose P1）：「想做 / 约了时间 / 没兑现的承诺」。
  * 到点主动开口时优先问这些，而不是泛泛地找话说。
+ *
+ * 谁来记：模型自己调 persona 工具的 `seed` 动作判断，不再用正则挖。
+ * 正则那条路（SEED_PATTERNS + mineSeeds）已经删掉——它会把
+ * 「我不会答应」当成承诺、把窥屏注入的提示当成对话，误报远比漏报烦人。
  */
 const MAX_SEEDS = 60
 const SEED_ASK_COOLDOWN_MS = 6 * 24 * 60 * 60_000
-const SEED_PATTERNS = [
-  { kind: 'promise', pattern: /(回头|下次|改天|待会|晚点|再聊|再说|等我有空|等我忙完|答应)/ },
-  { kind: 'plan', pattern: /(明天|后天|周末|下周|下个月|考试|面试|加班|出差|生日|旅行|医院|搬家|开会|比赛|约会)/ },
-  { kind: 'drive', pattern: /(想去|想吃|想玩|想买|想试|想学|好想|求推荐)/ },
-]
 
 /** 粗估到期时间：只有「明天/后天/周末」敢拍，其余按两天后的提醒窗口。 */
 function seedDueAt(kind, text, current = Date.now()) {
@@ -340,24 +339,6 @@ function seedDueAt(kind, text, current = Date.now()) {
 }
 
 /** 一句话里能挖出的种子；同一句只留一次。 */
-function mineSeeds(text, current = Date.now()) {
-  const body = String(text ?? '').replace(/\s+/g, ' ').trim()
-  if (body.length < 4) return []
-  const out = []
-  const seen = new Set()
-  for (const { kind, pattern } of SEED_PATTERNS) {
-    const match = pattern.exec(body)
-    if (match === null) continue
-    const snippet = body
-      .slice(Math.max(0, match.index - 12), Math.min(body.length, match.index + match[0].length + 24))
-      .trim()
-    if (snippet.length < 4 || seen.has(snippet)) continue
-    seen.add(snippet)
-    out.push({ kind, text: snippet.slice(0, 80), dueAt: seedDueAt(kind, snippet, current) })
-  }
-  return out
-}
-
 function normalizeSeed(raw, current = Date.now()) {
   const record = raw !== null && typeof raw === 'object' ? raw : {}
   const text = clean(record.text, 120)
@@ -384,8 +365,10 @@ function pickSeeds(seeds, current = Date.now(), limit = 3) {
   list.sort((a, b) => a.dueAt - b.dueAt || a.createdAt - b.createdAt)
   return list.slice(0, limit)
 }
-const MEMORY_KINDS = ['fact', 'preference', 'plan', 'event']
+const MEMORY_KINDS = ['fact', 'preference', 'plan', 'event', 'pattern']
 const MEMORY_IMPORTANCE_DEFAULT = 3
+/** 归纳出来的结论单独限量：太多会把具体事实挤掉。 */
+const MAX_PATTERN_MEMORIES = 12
 
 /**
  * 自动记忆：从第一人称陈述里捞「关于这个人的稳定事实」。
@@ -530,7 +513,23 @@ function mergeDuplicateMemories(records, threshold = 0.62) {
 
 /** 超出上限时按「置顶优先 → 综合分」淘汰。 */
 function trimMemories(records, current = Date.now()) {
-  const list = Array.isArray(records) ? records : []
+  let list = Array.isArray(records) ? records : []
+  // pattern 是归纳出来的结论，单独限量：不限的话它会一头挤掉具体事实。
+  const patterns = list.filter((record) => record.kind === 'pattern')
+  if (patterns.length > MAX_PATTERN_MEMORIES) {
+    const kept = patterns
+      .map((record) => ({ record, score: memoryScore(record, '', current).score }))
+      .sort((a, b) => {
+        const pinA = a.record.pinned === true || a.record.firstMet === true ? 1 : 0
+        const pinB = b.record.pinned === true || b.record.firstMet === true ? 1 : 0
+        if (pinA !== pinB) return pinB - pinA
+        return b.score - a.score
+      })
+      .slice(0, MAX_PATTERN_MEMORIES)
+      .map((item) => item.record)
+    const keepIds = new Set(kept.map((record) => record.id))
+    list = list.filter((record) => record.kind !== 'pattern' || keepIds.has(record.id))
+  }
   if (list.length <= MAX_MEMORIES) return list
   const scored = list.map((record) => ({ record, score: memoryScore(record, '', current).score }))
   scored.sort((a, b) => {
@@ -564,7 +563,12 @@ function selectMemories(records, query, current = Date.now(), options = {}) {
   for (const item of list) {
     if (picked.length >= maxItems) break
     const when = formatNoteTime(item.record.createdAt, current)
-    const line = when === '' ? item.record.text : `${when}：${item.record.text}`
+    // 重复次数要露出来：模型得先知道「这事已经第 4 次了」，才可能归纳出规律。
+    const repeat = Number(item.record.mergedCount) > 1
+      ? `（已提到 ${Math.min(99, Number(item.record.mergedCount))} 次）`
+      : ''
+    const body = `${item.record.text}${repeat}`
+    const line = when === '' ? body : `${when}：${body}`
     const cost = line.length + 3
     if (used + cost > budget) continue
     picked.push({ id: item.record.id, line, clarity: item.clarity, hits: item.hits })
@@ -1281,6 +1285,7 @@ function compileRuntime(persona, state, query, current = Date.now(), memories = 
     blocks.push([
       '[Long-term memories]',
       '这些是你以前记下的、跨会话还在的事。贴题时自然提一句，不要罗列。',
+      '括号里的「已提到 N 次」表示这件事反复出现过，不是随手一记。',
       ...memories.map((line) => `- ${escapePersonaBody(line)}`),
     ].join('\n'))
   }
@@ -1292,6 +1297,18 @@ function compileRuntime(persona, state, query, current = Date.now(), memories = 
       '对方说的这些值得跨会话记住：关于他自己的事（在哪、做什么、养了什么）、明确的偏好（喜欢什么、讨厌什么）、和没兑现的约定。',
       '碰到就调 persona 工具、action 用 memorize 记一条，一句话说清。一轮最多记一条。',
       '这轮的任务细节、临时状态、情绪不要记；已经在上面列出的事不要重复记。',
+      '如果同一件事已经反复出现——上面标着「已提到 N 次」，或者你在这段对话里已经劝过好几次——可以记一条归纳，action 仍用 memorize，kind 写 pattern。',
+      '归纳只写看得出来的习惯或规律，例如「常年熬夜，劝睡很少照做，顺着聊更有效」。不要评价人品，别写「懒」「不听话」这类判断。',
+    ].join('\n'))
+  }
+
+  // 惦记的事（种子）：只有目的机制开着才值得记——只有它会到点主动问。
+  if (persona.purposeEnabled === true) {
+    blocks.push([
+      '[惦记]',
+      '对方提到过、还没兑现的事值得记下来：答应了要做的、约了时间的、说想去做还没做的。',
+      '碰到就调 persona 工具、action 用 seed，一句话说清，kind 用 promise / plan / drive；知道大概几天后就给 inDays。',
+      '只记对方真说过的；你自己承诺的不算；这轮聊完就过去的小事也别记。',
     ].join('\n'))
   }
 
@@ -1606,6 +1623,33 @@ class PersonaStore {
     return cleared
   }
 
+  /**
+   * 找到这张卡最近有对话的会话。人格页是一级页面、没有 sessionId，
+   * 归纳记忆时用它兜底，省得用户还得先指定一个会话。
+   */
+  latestSessionForPersona(personaId) {
+    const target = String(personaId ?? '')
+    if (target === '') return ''
+    let best = ''
+    let bestAt = -1
+    let ids = []
+    try {
+      ids = [...this.bindings.keys()]
+    } catch {
+      return ''
+    }
+    for (const sessionId of ids) {
+      const binding = this.getBinding(sessionId)
+      if (binding === undefined || binding.personaId !== target) continue
+      const at = lastMessageAt(this.session(sessionId))
+      if (at > bestAt) {
+        bestAt = at
+        best = String(sessionId)
+      }
+    }
+    return best
+  }
+
   /** 记忆卡（MVP）：per-persona 的长期记忆，跨会话累积，跟会话正史分开放。 */
   listMemories(personaId) {
     const stored = this.memories.get(String(personaId))
@@ -1697,22 +1741,33 @@ class PersonaStore {
     return next
   }
 
-  /** 从素材里挖种子，近似重复的丢掉。 */
-  async harvestSeeds(personaId, materials, at = now()) {
+  /**
+   * 模型判断该惦记的事，直接写一条。近似重复的静默跳过（返回已有那条）。
+   * inDays 由模型给最好；没给就按 kind + 文本粗估，反正 pickSeeds 只在到期前后才问。
+   */
+  async addSeed(personaId, input = {}, at = now()) {
+    const text = clean(input.text, 120)
+    if (text === '') throw new Error('要惦记什么？给一句话。')
+    const kind = ['promise', 'plan', 'drive'].includes(input.kind) ? input.kind : 'promise'
     const existing = this.listSeeds(personaId)
-    const fresh = []
-    for (const item of Array.isArray(materials) ? materials : []) {
-      for (const seed of mineSeeds(item.text, at)) {
-        const duplicate = existing.some((kept) => kept.kind === seed.kind && memorySimilarity(kept.text, seed.text) > 0.6)
-          || fresh.some((kept) => kept.kind === seed.kind && memorySimilarity(kept.text, seed.text) > 0.6)
-        if (duplicate) continue
-        fresh.push({ ...seed, id: `s_${randomUUID()}`, createdAt: at, askedAt: 0, askedCount: 0 })
-      }
+    const duplicate = existing.find((seed) => seed.kind === kind && memorySimilarity(seed.text, text) > 0.6)
+    if (duplicate !== undefined) return { seed: duplicate, count: existing.length, duplicate: true }
+    const days = Number(input.inDays)
+    const dueAt = Number.isFinite(days) && days >= 0
+      ? at + Math.min(365, Math.round(days)) * 86_400_000
+      : seedDueAt(kind, text, at)
+    const seed = {
+      id: `s_${randomUUID()}`,
+      kind,
+      text: text.slice(0, 80),
+      dueAt,
+      createdAt: at,
+      askedAt: 0,
+      askedCount: 0,
     }
-    if (fresh.length === 0) return { added: 0, total: existing.length }
-    const next = [...existing, ...fresh].slice(-MAX_SEEDS)
+    const next = [...existing, seed].slice(-MAX_SEEDS)
     await this.putSeeds(personaId, next)
-    return { added: fresh.length, total: next.length }
+    return { seed, count: next.length, duplicate: false }
   }
 
   /** 自动记忆：从素材里捞稳定事实，去重后按低权重写进长期记忆。 */
@@ -2210,9 +2265,36 @@ async function observeScreen(dir = join(tmpdir(), 'dsh-persona-peek')) {
       kept = ''
     }
     if (title === '' && proc === '' && kept === '') return { ok: false, error: '没抓到前台窗口' }
+    // 一张截图 1–6 MB，攒着不放很快就上几百兆。只留最近若干张。
+    await prunePeekShots(dir)
     return { ok: true, seen: { title, process: proc, shot: kept } }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 截图只留最近这么多张：文件名是 `peek-<时间戳>.png`，字典序即时间序。 */
+const PEEK_SHOTS_KEEP = 20
+
+/**
+ * 清理旧截图。只认 `peek-<纯数字>.png`，手工留下的别的东西一律不动。
+ * 返回删掉几张；任何异常都吞掉，清理失败不影响这次窥屏。
+ */
+async function prunePeekShots(dir, keep = PEEK_SHOTS_KEEP) {
+  try {
+    const entries = await readdir(dir)
+    const shots = entries.filter((name) => /^peek-\d{10,}\.png$/.test(name)).sort()
+    if (shots.length <= keep) return 0
+    let removed = 0
+    for (const name of shots.slice(0, shots.length - keep)) {
+      try {
+        await unlink(join(dir, name))
+        removed += 1
+      } catch {}
+    }
+    return removed
+  } catch {
+    return 0
   }
 }
 
@@ -2225,6 +2307,9 @@ function peekPrompt(persona, seen) {
     '不要说“截图”“窥屏”“屏幕”这类词，不要解释你是怎么看到的；看不清或者内容太私人，就轻轻带过，别复述细节。',
   ].filter((line) => line !== '').join('\n')
 }
+
+/** 插件自己注入的提示开头：这些不是对话内容，挖种子和记忆时必须整条跳过。 */
+const INJECTED_MESSAGE_PREFIX = /^\[(窥屏|主动|记忆|思考语言|你顺手瞄了一眼屏幕|Scene|Mood|Long-term memories|Things you remember|Your standing with your master right now)\]/i
 
 /** 取会话最近消息当素材：只留双方文本，去掉太短的，限条数。 */
 function collectMaterials(session, config = PURPOSE_DEFAULT_CONFIG) {
@@ -2241,6 +2326,9 @@ function collectMaterials(session, config = PURPOSE_DEFAULT_CONFIG) {
     if (message?.role !== 'user' && message?.role !== 'assistant') continue
     const text = messageText(message).replace(/\s+/g, ' ').trim()
     if (text.length < 4) continue
+    // 插件自己注入的提示（窥屏 / 目的 / 记忆指令）role 和 source 都跟真人发言一样，
+    // 只能靠开头的标记认出来。不挡掉的话，种子和记忆会把它们当对话内容。
+    if (INJECTED_MESSAGE_PREFIX.test(text)) continue
     out.push({ role: message.role, text: text.slice(0, 160) })
   }
   return out.reverse()
@@ -2296,16 +2384,24 @@ function ownerOfSession(session) {
   return ''
 }
 
-function purposePrompt(persona, materials, seeds = [], extra = '') {
-  const lines = materials.map((item) => `${item.role === 'user' ? '对方' : '你'}：${item.text}`)
+function purposePrompt(persona, seeds = [], seen = null, extra = '') {
   const seedLines = (Array.isArray(seeds) ? seeds : []).map((seed) => `- ${seed.text}`)
+  // 会话里最近的对话本来就在上下文里，这里不再重复贴一遍；贴了模型容易照着复读。
+  // 屏幕那一段跟窥屏同源：同一个 observeScreen 结果，同样的措辞约束。
+  const screenLines = seen === null || seen === undefined
+    ? []
+    : [
+        '[你顺手瞄了一眼屏幕]',
+        `前台窗口：${seen.title || '（看不出来）'}｜程序：${seen.process || '（不知道）'}`,
+        seen.shot === '' ? '' : `截图在这：${seen.shot}。想看就打开看一眼，别凭窗名猜。`,
+      ].filter((line) => line !== '')
   return [
     `[主动] 这会儿没人跟你说话，你想找${masterNameOf(persona) || '主人'}说句话。`,
-    lines.length === 0 ? '' : `最近的对话片段（只是素材，别照着复读）：\n${lines.join('\n')}`,
+    ...screenLines,
     seedLines.length === 0 ? '' : `你心里还惦记着这几件事（可以顺口问一句，别像查岗）：\n${seedLines.join('\n')}`,
     extra,
     '挑一件真的值得开口的事：接着没说完的、提醒他答应过的事、问一句他提过的事，都可以。别为了说话而说话。',
-    '只说一两句，像平常聊天。不要提“素材”“记录”“系统”，不要解释你为什么忽然开口。',
+    '只说一两句，像平常聊天。不要提“素材”“记录”“系统”“截图”“屏幕”，不要解释你为什么忽然开口。',
     '想不出真的有意思的事就不吭声，只输出 [NO_REPLY]。',
   ].filter((line) => line !== '').join('\n')
 }
@@ -2468,18 +2564,27 @@ class PeekPilot {
           entry.watchdog.unref?.()
         }
       }
-      // P1：先把素材里的「想做/约了时间/没兑现」挖成种子，再挑到期该问的。
+      // 种子由模型在对话里自己记（persona 工具的 seed 动作），这里只负责挑该问的。
       let seeds = []
       try {
-        await this.store.harvestSeeds(active.persona.id, materials, at)
         seeds = pickSeeds(this.store.listSeeds(active.persona.id), at)
       } catch (error) {
-        this.ctx.logger?.warn?.('dsh-persona: seed harvest failed: %o', error)
+        this.ctx.logger?.warn?.('dsh-persona: seed pick failed: %o', error)
+      }
+      // 顺手看一眼屏幕，给这次开口一点现场感。看不成就不带，绝不因此不开口。
+      let seen = null
+      try {
+        const session = typeof this.store.session === 'function' ? this.store.session(sessionId) : undefined
+        const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
+        const result = await this.observe(cwd === '' ? undefined : join(cwd, '.screen'))
+        if (result !== null && result !== undefined && result.ok === true) seen = result.seen
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: purpose observe failed for %s: %o', sessionId, error)
       }
       agent.followup({
         id: `purpose_${randomUUID()}`,
         role: 'user',
-        content: [{ type: 'text', text: purposePrompt(active.persona, materials, seeds) }],
+        content: [{ type: 'text', text: purposePrompt(active.persona, seeds, seen) }],
         source: { kind: 'user' },
       })
       if (seeds.length > 0) {
@@ -2785,8 +2890,87 @@ function parseEnrichment(text) {
   return parsed
 }
 
-async function enrichPersona(ctx, store, agent, ref, overwrite) {
-  const persona = store.requirePersona(ref)
+const DIGEST_MAX_TURNS = 30
+const DIGEST_MAX_WRITTEN = 3
+const DIGEST_MAX_CHARS = 48
+/** 一眼就是评价人品的，直接扔掉：一条坏结论会长期污染行为，比漏记更糟。 */
+const DIGEST_BANNED = /懒|不听话|固执|没救|废物|拖延症|不上进|没出息/
+
+function parseDigest(text) {
+  const source = String(text ?? '')
+  const start = source.indexOf('{')
+  const end = source.lastIndexOf('}')
+  if (start < 0 || end < start) throw new Error('模型没有返回 JSON，归纳取消。')
+  let parsed
+  try {
+    parsed = JSON.parse(source.slice(start, end + 1))
+  } catch {
+    throw new Error('模型返回的 JSON 无法解析，归纳取消。')
+  }
+  const raw = Array.isArray(parsed?.patterns) ? parsed.patterns : []
+  const out = []
+  for (const item of raw) {
+    const line = clean(typeof item === 'string' ? item : '', DIGEST_MAX_CHARS)
+    if (line === '') continue
+    if (DIGEST_BANNED.test(line)) continue
+    if (out.includes(line)) continue
+    out.push(line)
+  }
+  return out
+}
+
+/**
+ * 归纳记忆：把这段对话和这张卡现有的记忆交给模型，让它写 1–3 条「规律」。
+ * 必须在会话里跑——只有那里模型看得见自己劝过什么、对方怎么回；
+ * 单看记忆列表只能归纳出一半（记忆只收对方说的话）。
+ */
+async function digestMemories(ctx, store, agent, personaId, sessionId) {
+  const persona = store.requirePersona(personaId)
+  // 人格页没有 sessionId：自动挑这张卡最近有对话的那个会话。
+  const sid = typeof sessionId === 'string' && sessionId !== ''
+    ? sessionId
+    : store.latestSessionForPersona(persona.id)
+  const session = sid === '' ? undefined : store.session(sid)
+  const turns = collectMaterials(session, { ...PURPOSE_DEFAULT_CONFIG, maxMaterials: DIGEST_MAX_TURNS })
+  if (turns.length < 2) throw new Error('这张卡最近的会话里还没有足够的对话可以归纳，先聊几句再试。')
+  const existing = store.listMemories(persona.id)
+
+  const system = [
+    '你只做一件事：从对话和已有记忆里提炼对方稳定的习惯与规律，输出 JSON。',
+    '不写事件流水账，不评价人品，不编造对话里没出现过的事。',
+  ].join('\n')
+
+  const request = [
+    `下面是「${persona.name}」和对方的最近对话，按时间顺序：`,
+    ...turns.map((item) => `${item.role === 'user' ? '对方' : persona.name}：${item.text}`),
+    '',
+    existing.length === 0 ? '这个角色目前还没有长期记忆。' : '已有的长期记忆（不要重复写）：',
+    ...existing.slice(0, 40).map((item) => `- [${item.kind}] ${item.text}`),
+    '',
+    '请归纳出 1–3 条关于对方的稳定习惯或规律，要求：',
+    '- 只看对话里真出现过的行为模式，例如「常常熬夜，劝睡很少照做，顺着聊更有效」。',
+    '- 一件事只写一条；没有足够证据就少写，甚至可以返回空数组。',
+    '- 不要写「懒」「不听话」「固执」这类对人品的判断。',
+    '- 每条一句话，不超过 40 字。',
+    '只输出 JSON：{"patterns":["……"]}',
+  ].join('\n')
+
+  const { text, route } = await askModel(ctx, agent, system, request, 900)
+  const patterns = parseDigest(text)
+  const added = []
+  for (const line of patterns.slice(0, DIGEST_MAX_WRITTEN)) {
+    // source 标成 digest，界面上能一眼认出哪些是归纳出来的、方便删。
+    const { record } = await store.rememberLong(
+      persona.id,
+      { text: line, kind: 'pattern', importance: 4 },
+      'digest',
+    )
+    if (record !== null && record !== undefined) added.push(record)
+  }
+  return { added, patterns, route }
+}
+
+async function enrichPersona(ctx, store, agent, ref, overwrite) {  const persona = store.requirePersona(ref)
   const active = agent !== undefined && store.active(agent.id)?.persona?.id === persona.id
   const state = active ? store.getState(agent.id, persona.id) : { notes: [] }
   const known = {}
@@ -2937,7 +3121,7 @@ export async function apply(ctx) {
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich', 'peek', 'memory', 'memorize', 'forget-memory', 'seeds', 'seed-forget'],
+          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich', 'peek', 'memory', 'memorize', 'digest', 'forget-memory', 'seeds', 'seed', 'seed-forget'],
           description: 'The operation to perform.',
         },
         id: { type: 'string', description: 'Persona id or exact name. Omit to address the active persona, except for use.' },
@@ -2980,7 +3164,8 @@ export async function apply(ctx) {
   // 这里再写一遍，是因为工具描述比 runtime 注入更靠后，模型最后看到的是它。
         memoryId: { type: 'string', description: 'For forget-memory: the memory id (or a unique fragment of its text).' },
         importance: { type: 'number', description: 'For memorize: 0-5, how much this matters. Higher importance decays slower; default 3.' },
-        kind: { type: 'string', description: 'For memorize: fact | preference | plan | event. Default fact.' },
+        kind: { type: 'string', description: 'For memorize: fact | preference | plan | event | pattern. For seed: promise | plan | drive. Default fact / promise.' },
+        inDays: { type: 'number', description: 'For seed: roughly how many days from now this promise or plan is due. Omit to let the plugin guess from the text.' },
         firstMet: { type: 'boolean', description: 'For memorize: mark this as the first meeting; it never decays and always ranks first.' },
         owner: { type: 'string', description: 'For memorize: whose memory this is (e.g. qq:591396639). Omit to auto-detect from the message prefix of the current turn.' },
         pinned: { type: 'boolean', description: 'For remember/pin: keep this fact in the turn-by-turn runtime context.' },
@@ -3099,6 +3284,25 @@ export async function apply(ctx) {
         return { ok: true, message: `惦记着 ${seeds.length} 件事：\n${lines}` }
       }
 
+      if (action === 'seed') {
+        const { persona } = store.requireActive(sessionId)
+        const text = String(args.memory ?? args.note ?? '').trim()
+        if (text === '') throw new Error('要惦记什么？用 memory 传一句话。')
+        const { seed, count, duplicate } = await store.addSeed(persona.id, {
+          text,
+          kind: args.kind,
+          inDays: args.inDays,
+        })
+        const due = new Date(seed.dueAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit' })
+        return {
+          ok: true,
+          message: duplicate
+            ? `这条已经惦记着了（第 ${count} 条）：${seed.text}`
+            : `记下了「${seed.text}」，${due} 前后会问一句。这张卡现在惦记着 ${count} 件事。`,
+          capsule: store.compileForSession(sessionId),
+        }
+      }
+
       if (action === 'seed-forget') {
         const { persona } = store.requireActive(sessionId)
         const ref = String(args.memoryId ?? args.memory ?? '').trim()
@@ -3139,6 +3343,19 @@ export async function apply(ctx) {
         return {
           ok: true,
           message: `已写入「${persona.name}」的长期记忆（共 ${count} 条，id: ${record.id}，重要度 ${record.importance}）。`,
+          capsule: store.compileForSession(sessionId),
+        }
+      }
+
+      if (action === 'digest') {
+        const { persona } = store.requireActive(sessionId)
+        const result = await digestMemories(ctx, store, agent, persona.id, sessionId)
+        const lines = result.added.map((record) => `- ${record.text}`).join('\n')
+        return {
+          ok: true,
+          message: result.added.length === 0
+            ? '这段对话里没看出足够稳定的规律，这次没写新的结论。'
+            : `归纳出 ${result.added.length} 条，已写入「${persona.name}」：\n${lines}`,
           capsule: store.compileForSession(sessionId),
         }
       }
@@ -3522,6 +3739,19 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: true, state, note, active: store.activeSnapshot(sessionId) })
             return
           }
+          if (op === 'memory-digest') {
+            const ref = body.id ?? (sessionId === '' ? undefined : store.active(sessionId)?.persona?.id)
+            if (ref === undefined) throw new Error('memory-digest 需要 id，或一个已绑定人格的 sessionId。')
+            const agentRef = anyAgent(ctx, sessionId)
+            const result = await digestMemories(ctx, store, agentRef, ref, sessionId)
+            sendJson(res, 200, {
+              ok: true,
+              added: result.added,
+              model: result.route ?? null,
+              memories: store.listMemories(store.requirePersona(ref).id),
+            })
+            return
+          }
           if (op === 'enrich') {
             const ref = body.id ?? (sessionId === '' ? undefined : store.active(sessionId)?.persona?.id)
             if (ref === undefined) throw new Error('enrich 需要 id，或一个已绑定人格的 sessionId。')
@@ -3581,6 +3811,11 @@ export const __test = {
   enrichPersona,
   purposeGapMs,
   clampGapMinutes,
+  prunePeekShots,
+  PEEK_SHOTS_KEEP,
+  parseDigest,
+  MAX_PATTERN_MEMORIES,
+  MEMORY_KINDS,
   normalizePersona,
   deriveTagCode,
   tagBlockOf,
@@ -3608,7 +3843,6 @@ export const __test = {
   lastMessageAt,
   mineMemories,
   normalizePersonaForTest: (input) => normalizePersona(input),
-  mineSeeds,
   pickSeeds,
   seedDueAt,
   normalizeSeed,
