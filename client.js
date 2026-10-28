@@ -121,6 +121,7 @@ window.__ModuleLoader__.load({
       'boundary.retry': '重试渲染',
       'boundary.reload': '刷新页面',
       'boundary.note': '重试只是清掉错误、按当前数据再画一次。如果一进来还是这个报错，说明是数据有问题，把上面的文字带过来。',
+      'boundary.dockTitle': '人格按钮出错了',
       'settings.peekSection': '窥屏',
       'settings.peekOffTag': '（已停用）',
       'settings.purposeSection': '目的机制',
@@ -312,6 +313,7 @@ window.__ModuleLoader__.load({
       'boundary.retry': 'Retry render',
       'boundary.reload': 'Reload page',
       'boundary.note': 'Retry just clears the error and redraws with the current data. If it comes right back, the data is the problem — send me the text above.',
+      'boundary.dockTitle': 'Persona buttons failed',
       'settings.peekSection': 'Peek',
       'settings.peekOffTag': ' (off)',
       'settings.purposeSection': 'Purpose',
@@ -2054,6 +2056,22 @@ window.__ModuleLoader__.load({
         const message = error instanceof Error
           ? `${error.name}: ${error.message}`
           : String(error)
+        // 输入框下面那排按钮只占一行：崩了就压成一条提示 + 重试，别撑开输入区。
+        if (this.props?.compact === true) {
+          return h('div', {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 8px',
+              fontSize: '12px',
+              opacity: 0.85,
+            },
+          },
+            h('span', null, `${RUNTIME.t('boundary.dockTitle')}：${message}`),
+            h('button', { type: 'button', onClick: this.retry }, RUNTIME.t('boundary.retry')),
+          )
+        }
         return h('div', { className: 'dsh-persona-field', style: { padding: '16px' } },
           h('div', { style: { fontWeight: 600, marginBottom: '6px' } }, RUNTIME.t('boundary.title')),
           h('div', { className: 'hint' }, RUNTIME.t('boundary.hint')),
@@ -2076,6 +2094,11 @@ window.__ModuleLoader__.load({
           h('div', { className: 'hint', style: { marginTop: '8px' } }, RUNTIME.t('boundary.note')),
         )
       }
+    }
+
+    /** 输入框那排按钮的兜底外壳：崩了只压成一条提示，不拖垮聊天输入区。 */
+    function PersonaDockSafe(props) {
+      return h(PersonaBoundary, { compact: true }, h(PersonaDock, props))
     }
 
     /** 一级页面：复用设置页那套编辑器，外面套一层限宽容器。 */
@@ -2111,7 +2134,7 @@ window.__ModuleLoader__.load({
           name: 'conversation.input.dock',
           id: 'dsh-persona',
           order: 30,
-        }, PersonaDock))
+        }, PersonaDockSafe))
 
         // 侧栏图标 + 主区域页面：和「插件」「自动化任务」同级的一级入口。
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
