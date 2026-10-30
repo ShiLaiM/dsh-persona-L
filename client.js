@@ -96,6 +96,10 @@ window.__ModuleLoader__.load({
       'settings.memeFrequencyHint': '0–100：平均每 100 条回复里带图的条数，30 约等于三条一张。需要在装发图工具（send_meme）的环境里才生效。',
       'settings.peekEnabled': '窥屏默认开关（会话没单独设置时用这个）',
       'settings.peekEnabledHint': '默认关。打开后按间隔截一张屏，再按概率决定要不要主动搭话。单个会话可以在聊天框上方的「窥屏」按钮里单独开关，互不影响。只在 Windows、且这个会话空闲时生效，截图只留在本机。',
+      'settings.selfPeek': '允许它自己决定看一眼屏幕',
+      'settings.selfPeekHint': '默认关。打开后，它在接不上话、或者怀疑你在忙别的时会自己看一眼当下的屏幕——不是定时截，是它觉得需要才看。每 15 分钟最多一次、每天 8 次，次数记在这张卡上，换会话共用一个额度。只在 Windows 生效，截图只留在本机。',
+      'settings.selfPeekNever': '今天还没看过（上限 {max} 次）',
+      'settings.selfPeekUsed': '今日已看 {count}/{max} 次，上次 {time}',
       'settings.peekScheduleEnabled': '按高峰 / 空闲分档',
       'settings.peekScheduleHint': '开：高峰时段用「高峰」那组间隔和概率，其余时间用「空闲」那组。关：全天共用空闲那组。',
       'settings.peekBusyRanges': '高峰时段（本机时间）',
@@ -303,6 +307,10 @@ window.__ModuleLoader__.load({
       'settings.memeFrequencyHint': '0-100 stickers per 100 replies; 30 is roughly one in three. Needs the send_meme sticker tool.',
       'settings.peekEnabled': 'Peek by default (sessions that never chose)',
       'settings.peekEnabledHint': 'Off by default. Takes a screenshot on an interval and decides, by chance, whether to start a conversation. Each session can toggle the 「窥屏」 button above the composer on its own. Windows only, idle sessions only; screenshots stay on this machine.',
+      'settings.selfPeek': 'Let it decide to look at the screen by itself',
+      'settings.selfPeekHint': 'Off by default. When on, it looks at the screen on its own when it cannot follow the conversation or suspects you are doing something else — not on a timer, only when it judges it is needed. At most once per 15 minutes and 8 times a day, counted per card and shared across sessions. Windows only; screenshots stay on this machine.',
+      'settings.selfPeekNever': 'Not looked yet today (limit {max})',
+      'settings.selfPeekUsed': 'Looked {count}/{max} times today, last at {time}',
       'settings.peekScheduleEnabled': 'Split busy / idle hours',
       'settings.peekScheduleHint': 'On: the busy band below applies inside the busy hours, the idle band everywhere else. Off: one setting for the whole day.',
       'settings.peekBusyRanges': 'Busy hours (local time)',
@@ -1082,6 +1090,7 @@ window.__ModuleLoader__.load({
         purposeMinGapMinutes: 60,
         purposeMaxGapMinutes: 120,
         autoMemory: false,
+        selfPeek: false,
       }
     }
 
@@ -1128,7 +1137,19 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = useState('')
       const [error, setError] = useState('')
       const [busy, setBusy] = useState(false)
+      // 主动看一眼的额度（今日已看几次、上次什么时候），跟着 get 一起回来。
+      // 新 state 一律加在这后面：测试按 useState 调用顺序喂预设值，插在中间会把后面的全部错位。
+      const [look, setLook] = useState(null)
       const fileRef = useRef(null)
+
+      /** 只给「上次几点」用，跨天不需要日期。 */
+      const clockText = (at) => {
+        const ms = Number(at)
+        if (!Number.isFinite(ms) || ms <= 0) return '—'
+        const d = new Date(ms)
+        const pad = (n) => String(n).padStart(2, '0')
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+      }
 
       const loadList = useCallback(async () => {
         try {
@@ -1183,6 +1204,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await api('get', { id })
           setDraft(data.persona)
+          setLook(data.look ?? null)
           setTagsText((data.persona.tags ?? []).join(', '))
           await loadPreview(id)
           await loadMemories(id)
@@ -1335,6 +1357,7 @@ window.__ModuleLoader__.load({
             purposeMinGapMinutes: num(draft.purposeMinGapMinutes, 60),
             purposeMaxGapMinutes: num(draft.purposeMaxGapMinutes, 120),
             autoMemory: draft.autoMemory === true,
+            selfPeek: draft.selfPeek === true,
           }
           let id = draft.id
           if (id) {
@@ -1346,6 +1369,7 @@ window.__ModuleLoader__.load({
           }
           const data = await api('get', { id })
           setDraft(data.persona)
+          setLook(data.look ?? null)
           setTagsText((data.persona.tags ?? []).join(', '))
           await loadList()
           await loadPreview(id)
@@ -1367,6 +1391,7 @@ window.__ModuleLoader__.load({
           const data = await api('enrich', { id: draft.id })
           const fresh = await api('get', { id: draft.id })
           setDraft(fresh.persona)
+          setLook(fresh.look ?? null)
           setTagsText((fresh.persona.tags ?? []).join(', '))
           await loadList()
           await loadPreview(draft.id)
@@ -1859,6 +1884,25 @@ window.__ModuleLoader__.load({
                         ` ${t('settings.peekEnabled')}`,
                       ),
                       h('div', { className: 'hint' }, t('settings.peekEnabledHint')),
+                    ),
+                    h('div', { className: 'dsh-persona-field' },
+                      h('label', { className: 'dsh-persona-check' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: draft.selfPeek === true,
+                          onChange: (event) => { void toggleNow('selfPeek', event.target.checked) },
+                        }),
+                        ` ${t('settings.selfPeek')}`,
+                      ),
+                      h('div', { className: 'hint' }, t('settings.selfPeekHint')),
+                      draft.selfPeek === true && look !== null
+                        ? h('div', { className: 'hint' }, look.count > 0
+                          ? t('settings.selfPeekUsed')
+                              .replace('{count}', String(look.count))
+                              .replace('{max}', String(look.max))
+                              .replace('{time}', clockText(look.lastAt))
+                          : t('settings.selfPeekNever').replace('{max}', String(look.max)))
+                        : null,
                     ),
                     h('div', { className: 'dsh-persona-field' },
                       h('label', { className: 'dsh-persona-check' },

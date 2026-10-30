@@ -38,8 +38,14 @@ const ROUTE_PATH = '/dsh-persona/api'
  * capsule, while per-turn material (scene, mood, canon notes) lives in a
  * separate runtime context so it never invalidates the prompt cache.
  */
-const MAX_CARD_CHARS = 3800
+const MAX_CARD_CHARS = 5000
 const MAX_RUNTIME_CHARS = 1100
+/**
+ * 主动看一眼（selfPeek）：模型自己判断要不要看主人此刻的屏幕。
+ * 冷却和日限都是硬闸——不设的话，模型看见这能力就会每轮都调一次。
+ */
+const LOOK_COOLDOWN_MS = 15 * 60_000
+const LOOK_DAILY_MAX = 8
 const MAX_REPLY_CHARS_LIMIT = 4000
 const MAX_BODY_BYTES = 2 * 1024 * 1024
 const MAX_NOTES = 50
@@ -424,6 +430,8 @@ function normalizeMemoryRecord(raw, current = Date.now()) {
       : [],
     createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : current,
     lastSeenAt: Number.isFinite(Number(record.lastSeenAt)) ? Number(record.lastSeenAt) : current,
+    /** 上次被注入到上下文的时间。用来给「重提旧事」上冷却，0 = 从没提过。 */
+    lastInjectedAt: Number.isFinite(Number(record.lastInjectedAt)) ? Number(record.lastInjectedAt) : 0,
     source: typeof record.source === 'string' ? record.source.slice(0, 120) : '',
   }
 }
@@ -435,6 +443,45 @@ function memoryClarity(record, current = Date.now()) {
   const halfLifeDays = 7 + importance * 12
   const ageDays = Math.max(0, (current - Number(record?.createdAt ?? current)) / 86_400_000)
   return Math.max(0, Math.min(1, Math.pow(0.5, ageDays / halfLifeDays)))
+}
+
+/**
+ * 只认最保守的几种自述。宁可漏，不可错——抽错了会变成「主人说过的话」污染长期记忆，
+ * 比没记更糟。所以每条都要求显式的主语 + 明确的事实，不收推测和否定。
+ */
+const SELF_DISCLOSURE_PATTERNS = [
+  // 叫我什么
+  /我叫[^\s，。,.！!？?；;：:、]{1,12}/u,
+  // 喜好
+  /我(?:很|最|特别|超级)?(?:喜欢|讨厌|不喜欢|受不了|爱吃)[^\s，。,.！!？?；;：:、]{1,16}/u,
+  // 住处
+  /我(?:住在|家在|老家在)[^\s，。,.！!？?；;：:、]{2,16}/u,
+  // 明确要求记住
+  /(?:请)?记住[：:，,]?[^\s，。,.！!？?；;：:、]{2,24}/u,
+  // 在哪儿上班
+  /我在[^\s，。,.！!？?；;：:、]{2,16}(?:上班|工作)/u,
+  // 作息
+  /我(?:一般|通常|经常|总是|每天)?(?:熬夜|通宵|早起|失眠|睡不好)/u,
+  // 养的动物
+  /我(?:家|养了?)[^\s，。,.！!？?；;：:、]{0,10}(?:猫|狗|鱼|鸟|仓鼠|龟|兔)/u,
+  // 过敏
+  /我对[^\s，。,.！!？?；;：:、]{1,10}过敏/u,
+]
+
+/** 从一段话里捞出最多两条自述，捞不到就是空数组。 */
+function extractSelfDisclosure(text) {
+  const body = clean(text, 800)
+  if (body === '') return []
+  const out = []
+  for (const pattern of SELF_DISCLOSURE_PATTERNS) {
+    const match = pattern.exec(body)
+    if (match === null) continue
+    const snippet = match[0].replace(/\s+/g, ' ').trim().slice(0, 48)
+    if (snippet.length < 4) continue
+    if (out.includes(snippet)) continue
+    out.push(snippet)
+  }
+  return out.slice(0, 2)
 }
 
 /** 中文双字片段的粗命中数：够用、便宜，不需要分词库。 */
@@ -449,12 +496,31 @@ function queryHits(text, query) {
   return hits
 }
 
+/** 提过一次的旧事，半小时内不再排到前面。置顶 / 初遇不受影响（排序时先比它们）。 */
+const RECALL_COOLDOWN_MS = 30 * 60_000
+
+/**
+ * 同一次 turn 里，模型多步调工具会反复要 runtime 上下文。几秒内结果一样，
+ * 缓存住既能省重复计算，也能避免「刚标成已提过、下一轮又算一遍」。
+ */
+const RUNTIME_CACHE_MS = 3000
+
+/** 这轮模型已经调过 memorize 的话，正则兜底就别再插手了。 */
+const HARVEST_SKIP_AFTER_MEMORIZE_MS = 5 * 60_000
+
 function memoryScore(record, query, current = Date.now(), owner = '') {
   const clarity = memoryClarity(record, current)
   const importance = clampInt(record?.importance, MEMORY_IMPORTANCE_DEFAULT, 0, 5) / 5
   const hits = queryHits(record?.text, query)
   const sameOwner = owner !== '' && record?.owner === owner ? 0.15 : 0
-  return { score: importance * 0.55 + clarity * 0.35 + Math.min(0.4, hits * 0.2) + sameOwner, clarity, hits }
+  // 刚被注入过的往后退：不这么做，同一件旧事会连着好几轮被翻出来，
+  // 而且每次触发都更强（query 里反复出现的词会一直命中它）。
+  const lastInjected = Number(record?.lastInjectedAt)
+  const onCooldown = Number.isFinite(lastInjected) && lastInjected > 0
+    && current - lastInjected < RECALL_COOLDOWN_MS
+  const penalty = onCooldown ? 0.5 : 0
+  const raw = importance * 0.55 + clarity * 0.35 + Math.min(0.4, hits * 0.2) + sameOwner - penalty
+  return { score: Math.max(0, raw), clarity, hits, onCooldown }
 }
 
 /** 中文双字片段的集合，用来算两条记忆像不像。 */
@@ -505,6 +571,7 @@ function mergeDuplicateMemories(records, threshold = 0.62) {
       tags: [...new Set([...(existing.tags ?? []), ...(record.tags ?? [])])].slice(0, 6),
       createdAt: Math.min(existing.createdAt, record.createdAt),
       lastSeenAt: Math.max(existing.lastSeenAt, record.lastSeenAt),
+      lastInjectedAt: Math.max(Number(existing.lastInjectedAt) || 0, Number(record.lastInjectedAt) || 0),
       mergedCount: (existing.mergedCount ?? 1) + (record.mergedCount ?? 1),
     }
   }
@@ -585,6 +652,44 @@ function selectMemories(records, query, current = Date.now(), options = {}) {
 function masterNameOf(persona) {
   const raw = clean(persona?.masterName, FIELD_LIMITS.masterName)
   return raw.replace(/[「」『』"]/g, '').trim()
+}
+
+/** 旧称呼最多留这么多个，再多也没意义——正常不会改这么多次。 */
+const MAX_MASTER_NAME_HISTORY = 8
+
+/** 旧称呼的规范化：去掉引号、去掉过短过长的、去重、只留最近几个。 */
+function cleanNameHistory(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  for (const raw of value) {
+    const name = masterNameOf({ masterName: raw })
+    if (name.length < 2 || name.length > 20) continue
+    if (out.includes(name)) continue
+    out.push(name)
+    if (out.length > MAX_MASTER_NAME_HISTORY) out.shift()
+  }
+  return out
+}
+
+/**
+ * 旧称呼清洗：改过称呼之后，老记忆和老正史里还留着旧叫法。原样塞回提示词，
+ * 模型就会开口叫错人。注入前就地换掉——只动这一次的注入文本，不改库里的原文。
+ *
+ * 太短的旧称呼不换：一个字的称呼几乎一定会误伤正常词句。
+ */
+function replaceMasterNames(text, current, history) {
+  const body = String(text ?? '')
+  if (body === '') return body
+  const to = masterNameOf({ masterName: current })
+  if (to === '') return body
+  if (!Array.isArray(history) || history.length === 0) return body
+  let out = body
+  for (const raw of history) {
+    const from = masterNameOf({ masterName: raw })
+    if (from.length < 2 || from === to) continue
+    out = out.split(from).join(to)
+  }
+  return out
 }
 
 /**
@@ -884,6 +989,10 @@ function normalizePersona(input, existing) {
         purposeMaxGapMinutes: PURPOSE_GAP_MAX_DEFAULT,
         /** 自动记忆：从对方说的话里捞事实和偏好，默认关。 */
         autoMemory: false,
+        /** 主动看一眼：让模型自己判断要不要看屏幕，默认关。 */
+        selfPeek: false,
+        /** 改过的旧称呼：注入时要把记忆和正史里的旧叫法换掉，不然会叫错人。 */
+        masterNameHistory: [],
         archived: false,
       }
     : { ...existing }
@@ -939,6 +1048,10 @@ function normalizePersona(input, existing) {
   }
   if (input.autoMemory !== undefined) out.autoMemory = input.autoMemory === true
   if (out.autoMemory !== true) out.autoMemory = false
+  if (input.selfPeek !== undefined) out.selfPeek = input.selfPeek === true
+  if (out.selfPeek !== true) out.selfPeek = false
+  if (input.masterNameHistory !== undefined) out.masterNameHistory = cleanNameHistory(input.masterNameHistory)
+  if (!Array.isArray(out.masterNameHistory)) out.masterNameHistory = []
   if (input.peekBusyRanges !== undefined) out.peekBusyRanges = clean(input.peekBusyRanges, MAX_PEEK_RANGES_CHARS)
   if (typeof out.peekBusyRanges !== 'string') out.peekBusyRanges = PEEK_BUSY_RANGES_DEFAULT
   if (input.peekBusyEveryMinutes !== undefined) {
@@ -1257,48 +1370,26 @@ function selectNotes(state, query, current = Date.now()) {
  */
 function compileRuntime(persona, state, query, current = Date.now(), memories = []) {
   if (persona === undefined || persona === null) return { text: '', trace: null }
+  // 改过称呼之后，老记忆/老正史里还留着旧叫法。注入前统一换掉，
+  // 只影响这一次的注入文本，库里的原文不动。
+  const nameHistory = Array.isArray(persona.masterNameHistory) ? persona.masterNameHistory : []
+  const currentName = persona.masterName
+  const rename = (text) => replaceMasterNames(text, currentName, nameHistory)
   const blocks = []
   // 带人格的会话：思考过程一律中文。放最前面，避免被尾部截断吃掉。
   blocks.push([
     '[思考语言]',
     '你的内部推理与思考过程一律用中文写，不要用英文。',
   ].join('\n'))
-  const scene = clean(state?.scene, 1000)
-  if (scene !== '') blocks.push(`[Scene]\n${escapePersonaBody(scene)}`)
-  const mood = clean(state?.mood, 200)
-  if (mood !== '') blocks.push(`[Mood]\n${escapePersonaBody(mood)}`)
-  const relationship = clean(state?.relationship, 500)
-  if (relationship !== '' && relationship !== clean(persona.relationship, 500)) {
-    blocks.push(`[Your standing with your master right now]\n${escapePersonaBody(relationship)}`)
-  }
 
-  const { picked, omitted, chars } = selectNotes(state, query, current)
-  if (picked.length > 0) {
+  // 能力说明整组排在内容前面：这几块讲的是「你能不能做某件事」，
+  // 一旦被预算截掉，模型就不知道有这个动作，功能等于不存在。宁可丢场景，不能丢它们。
+  if (persona.selfPeek === true) {
     blocks.push([
-      '[Things you remember]',
-      'These are your own experiences and commitments. Bring one up only when it is relevant; do not recite the list.',
-      ...picked.map((note) => `- ${escapePersonaBody(note.line)}`),
-    ].join('\n'))
-  }
-
-  if (Array.isArray(memories) && memories.length > 0) {
-    blocks.push([
-      '[Long-term memories]',
-      '这些是你以前记下的、跨会话还在的事。贴题时自然提一句，不要罗列。',
-      '括号里的「已提到 N 次」表示这件事反复出现过，不是随手一记。',
-      ...memories.map((line) => `- ${escapePersonaBody(line)}`),
-    ].join('\n'))
-  }
-
-  // 自动记忆：不靠正则猜，改成让模型按上下文自己判断（只在卡上开了才出现）。
-  if (persona.autoMemory === true) {
-    blocks.push([
-      '[记忆]',
-      '对方说的这些值得跨会话记住：关于他自己的事（在哪、做什么、养了什么）、明确的偏好（喜欢什么、讨厌什么）、和没兑现的约定。',
-      '碰到就调 persona 工具、action 用 memorize 记一条，一句话说清。一轮最多记一条。',
-      '这轮的任务细节、临时状态、情绪不要记；已经在上面列出的事不要重复记。',
-      '如果同一件事已经反复出现——上面标着「已提到 N 次」，或者你在这段对话里已经劝过好几次——可以记一条归纳，action 仍用 memorize，kind 写 pattern。',
-      '归纳只写看得出来的习惯或规律，例如「常年熬夜，劝睡很少照做，顺着聊更有效」。不要评价人品，别写「懒」「不听话」这类判断。',
+      '[看一眼]',
+      '你可以主动看一眼主人此刻的屏幕：调 persona 工具，action 用 look。',
+      '只在真需要时才看——对方说的东西你接不上、或者怀疑他其实在忙别的。闲聊、寒暄、你已经知道答案的时候不要看。',
+      '看完直接接话，别说「我看了看屏幕」这类话；看不清或内容太私人，就轻轻带过。',
     ].join('\n'))
   }
 
@@ -1312,6 +1403,45 @@ function compileRuntime(persona, state, query, current = Date.now(), memories = 
     ].join('\n'))
   }
 
+  // 自动记忆：不靠正则猜，改成让模型按上下文自己判断（只在卡上开了才出现）。
+  // 门槛刻意放低：写重了有合并兜着，漏了就真没了。
+  if (persona.autoMemory === true) {
+    blocks.push([
+      '[记忆]',
+      '对方说了关于他自己的事就记——在哪、做什么、养了什么、在意什么、讨厌什么、答应过什么。',
+      '碰到就调 persona 工具，action 用 memorize，一句话说清。拿不准该不该记就先记下来：写重了会自动合并，漏了就没了。',
+      '只排除这三种：这轮的任务细节、临时状态、正在闹的情绪。上面已经列出的事不要重复记。',
+      '同一件事反复出现时（上面标着「已提到 N 次」），记一条归纳，action 仍用 memorize，kind 写 pattern；只写看得出的规律，不要评价人品。',
+    ].join('\n'))
+  }
+
+  const scene = clean(state?.scene, 1000)
+  if (scene !== '') blocks.push(`[Scene]\n${escapePersonaBody(rename(scene))}`)
+  const mood = clean(state?.mood, 200)
+  if (mood !== '') blocks.push(`[Mood]\n${escapePersonaBody(rename(mood))}`)
+  const relationship = clean(state?.relationship, 500)
+  if (relationship !== '' && relationship !== clean(persona.relationship, 500)) {
+    blocks.push(`[Your standing with your master right now]\n${escapePersonaBody(rename(relationship))}`)
+  }
+
+  const { picked, omitted, chars } = selectNotes(state, query, current)
+  if (picked.length > 0) {
+    blocks.push([
+      '[Things you remember]',
+      'These are your own experiences and commitments. Bring one up only when it is relevant; do not recite the list.',
+      ...picked.map((note) => `- ${escapePersonaBody(rename(note.line))}`),
+    ].join('\n'))
+  }
+
+  if (Array.isArray(memories) && memories.length > 0) {
+    blocks.push([
+      '[Long-term memories]',
+      '这些是你以前记下的、跨会话还在的事。贴题时自然提一句，不要罗列。',
+      '括号里的「已提到 N 次」表示这件事反复出现过，不是随手一记。',
+      ...memories.map((line) => `- ${escapePersonaBody(rename(line))}`),
+    ].join('\n'))
+  }
+
   const trace = {
     at: current,
     query: String(query ?? '').slice(0, 160),
@@ -1322,12 +1452,13 @@ function compileRuntime(persona, state, query, current = Date.now(), memories = 
   }
 
   if (blocks.length === 0) return { text: '', trace }
-  const body = blocks.join('\n\n')
-  const text = body.length > MAX_RUNTIME_CHARS
-    ? `${body.slice(0, MAX_RUNTIME_CHARS - 1)}…`
-    : body
+  // 超预算时整块整块地丢，不硬切：切一半的指令比没有更糟，模型会照着半句话乱来。
+  const kept = [...blocks]
+  while (kept.length > 1 && kept.join('\n\n').length > MAX_RUNTIME_CHARS) kept.pop()
+  let body = kept.join('\n\n')
+  if (body.length > MAX_RUNTIME_CHARS) body = `${body.slice(0, MAX_RUNTIME_CHARS - 1)}…`
   return {
-    text: `<persona-moment name="${escapeAttribute(persona.name)}">\n${text}\n</persona-moment>`,
+    text: `<persona-moment name="${escapeAttribute(persona.name)}">\n${body}\n</persona-moment>`,
     trace,
   }
 }
@@ -1468,6 +1599,10 @@ class PersonaStore {
     this.memories = domain.table('memories')
     this.traces = new Map()
     this.queryCache = new Map()
+    /** 同一次 turn 里多步工具循环会重复要 runtime，缓存几秒省掉重复计算和重复写库。 */
+    this.runtimeCache = new Map()
+    /** 每个会话最近一次调 memorize 的时间：正则兜底用它判断「模型这轮已经记过了」。 */
+    this.memorizeAt = new Map()
   }
 
   listPersonas(includeArchived = false) {
@@ -1519,6 +1654,14 @@ class PersonaStore {
     const current = this.getPersona(id)
     if (current === undefined) throw new Error(`找不到人格「${id}」。`)
     const next = normalizePersona({ ...current, ...(patch ?? {}) }, current)
+    // 称呼改了：把旧称呼记下来，注入时好把记忆和正史里的旧叫法换掉。
+    const before = masterNameOf(current)
+    const after = masterNameOf(next)
+    if (before !== '' && before !== after) {
+      next.masterNameHistory = cleanNameHistory([...(next.masterNameHistory ?? []), before])
+    } else {
+      next.masterNameHistory = cleanNameHistory(next.masterNameHistory ?? [])
+    }
     await this.personas.put(current.id, next)
     // 目的机制从关变开：把这张卡名下的排程清零，让它重新走「首轮 30 分钟」，
     // 而不是接着一个几天前的 purposeNextAt 干等。
@@ -1671,6 +1814,28 @@ class PersonaStore {
     return next
   }
 
+  /**
+   * 记下这几条记忆这次被注入了。只改字段，不走 merge / snapshot——
+   * 这个方法每轮都会跑，不能带 putMemories 那套重活。
+   */
+  async markMemoriesInjected(personaId, ids, at = now()) {
+    if (!Array.isArray(ids) || ids.length === 0) return 0
+    const stored = this.memories.get(String(personaId))
+    const records = Array.isArray(stored?.records) ? stored.records : []
+    if (records.length === 0) return 0
+    const wanted = new Set(ids)
+    let touched = 0
+    const next = records.map((record) => {
+      if (!wanted.has(record.id)) return record
+      if (Number(record.lastInjectedAt) === at) return record
+      touched += 1
+      return { ...record, lastInjectedAt: at }
+    })
+    if (touched === 0) return 0
+    await this.memories.put(String(personaId), { ...stored, records: next, updatedAt: at })
+    return touched
+  }
+
   async rememberLong(personaId, input = {}, source = '') {
     const records = this.listMemories(personaId)
     const record = normalizeMemoryRecord({
@@ -1690,6 +1855,37 @@ class PersonaStore {
     kept.push(record)
     const next = await this.putMemories(personaId, kept)
     return { record, count: next.records.length }
+  }
+
+  /**
+   * 正则兜底：模型忘了调 memorize 的时候，从这轮主人说的话里捞一两句明确的自述。
+   * 只在卡上开了 autoMemory、且这轮确实没调过 memorize 时才补——不跟模型抢活。
+   * 重要度压到 1：正则捡来的不如模型判断的可靠，先让它容易淡出。
+   */
+  async harvestSelfDisclosure(session) {
+    const sessionId = typeof session?.id === 'string' ? session.id : ''
+    if (sessionId === '') return 0
+    const active = this.active(sessionId)
+    if (active === null || active.persona.autoMemory !== true) return 0
+    const at = now()
+    const memorized = Number(this.memorizeAt.get(sessionId) ?? 0)
+    if (memorized > 0 && at - memorized < HARVEST_SKIP_AFTER_MEMORIZE_MS) return 0
+    const found = extractSelfDisclosure(this.lastUserText(session))
+    if (found.length === 0) return 0
+    const owner = ownerOfSession(session)
+    const existing = this.listMemories(active.persona.id)
+    let written = 0
+    for (const text of found) {
+      // 库里有近似的一条就别再记，「我喜欢猫」不需要三份。
+      if (existing.some((record) => memorySimilarity(record.text, text) >= 0.62)) continue
+      try {
+        await this.rememberLong(active.persona.id, { text, kind: 'fact', importance: 1, owner }, 'regex')
+        written += 1
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-persona: regex harvest failed: %o', error)
+      }
+    }
+    return written
   }
 
   async forgetLong(personaId, ref) {
@@ -1725,6 +1921,25 @@ class PersonaStore {
     const current = this.getPurposeBudget(personaId, at)
     const next = { day: current.day, count: current.count + 1, lastAt: at }
     await this.memories.put(`${String(personaId)}#purpose`, next)
+    return next
+  }
+
+  /** 主动看一眼的闸门：跟目的配额一样按卡算、跨会话共享。 */
+  getLookBudget(personaId, at = now()) {
+    const entry = this.memories.get(`${String(personaId)}#look`)
+    const day = localDayKey(at)
+    const lastAt = Number.isFinite(Number(entry?.lastAt)) ? Number(entry.lastAt) : 0
+    if (entry === null || entry === undefined || typeof entry !== 'object' || entry.day !== day) {
+      // 跨天只重置次数，最后看一眼的时间留着——冷却不该因为过了零点就作废。
+      return { day, count: 0, lastAt }
+    }
+    return { day, count: clampInt(entry.count, 0, 0, 999), lastAt }
+  }
+
+  async bumpLookBudget(personaId, at = now()) {
+    const current = this.getLookBudget(personaId, at)
+    const next = { day: current.day, count: current.count + 1, lastAt: at }
+    await this.memories.put(`${String(personaId)}#look`, next)
     return next
   }
 
@@ -2041,14 +2256,31 @@ class PersonaStore {
 
   runtimeForSession(sessionId) {
     const active = this.active(sessionId)
-    if (active === null) return ''
+    if (active === null) {
+      this.runtimeCache.delete(sessionId)
+      return ''
+    }
     const state = this.getState(sessionId, active.persona.id)
-    const query = this.lastUserText(this.session(sessionId))
     const session = this.session(sessionId)
+    const query = this.lastUserText(session)
+    // 同 turn 内重复调用直接复用：模型一步里连调几个工具时，这段会被要好几遍。
+    const cacheKey = `${active.persona.id}|${active.persona.revision}|${JSON.stringify(state)}|${query}`
+    const nowMs = Date.now()
+    const cached = this.runtimeCache.get(sessionId)
+    if (cached !== undefined && cached.key === cacheKey && nowMs - cached.at < RUNTIME_CACHE_MS) {
+      return cached.text
+    }
     const owner = ownerOfSession(session)
-    const memories = this.selectMemoriesFor(active.persona.id, query, Date.now(), owner).picked.map((item) => item.line)
-    const runtime = compileRuntime(active.persona, state, query, Date.now(), memories)
+    const picked = this.selectMemoriesFor(active.persona.id, query, nowMs, owner).picked
+    const runtime = compileRuntime(active.persona, state, query, nowMs, picked.map((item) => item.line))
     this.traces.set(sessionId, runtime.trace)
+    this.runtimeCache.set(sessionId, { key: cacheKey, at: nowMs, text: runtime.text })
+    // 记下这次提了哪几条：下一轮同样的旧事会被冷却压到后面，不会连着翻出来。
+    if (picked.length > 0) {
+      void this.markMemoriesInjected(active.persona.id, picked.map((item) => item.id), nowMs).catch((error) => {
+        this.ctx.logger?.warn?.('dsh-persona: mark injected failed: %o', error)
+      })
+    }
     return runtime.text
   }
 
@@ -3039,6 +3271,7 @@ function toolPatch(args) {
   if (args.peekBusyRanges !== undefined) patch.peekBusyRanges = args.peekBusyRanges
   if (args.peekBusyEveryMinutes !== undefined) patch.peekBusyEveryMinutes = args.peekBusyEveryMinutes
   if (args.peekBusyChance !== undefined) patch.peekBusyChance = args.peekBusyChance
+  if (args.selfPeek !== undefined) patch.selfPeek = args.selfPeek
   if (args.archived !== undefined) patch.archived = args.archived
   return patch
 }
@@ -3053,6 +3286,18 @@ function toolListMessage(personas) {
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** 主动看一眼的当前额度，给前端显示用。 */
+function lookStatus(store, persona, at = now()) {
+  const budget = store.getLookBudget(persona.id, at)
+  return {
+    day: budget.day,
+    count: budget.count,
+    max: LOOK_DAILY_MAX,
+    lastAt: budget.lastAt,
+    cooldownMs: LOOK_COOLDOWN_MS,
+  }
 }
 
 export const inject = ['storageDomain', 'systemPrompt', 'tools']
@@ -3073,6 +3318,15 @@ export async function apply(ctx) {
     if (event?.type !== 'turn/end') return
     peek.onTurnEnd(session?.id)
   }), 'dsh-persona: peek turn end')
+
+  // 正则兜底：模型这轮要是忘了调 memorize，从主人说的话里捞一两句明确的自述补上。
+  // 只补「我叫 / 我喜欢 / 我住在 / 记住」这几种，宁漏勿错。
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    if (event?.type !== 'turn/end') return
+    void store.harvestSelfDisclosure(session).catch((error) => {
+      ctx.logger?.warn?.('dsh-persona: self disclosure harvest failed: %o', error)
+    })
+  }), 'dsh-persona: self disclosure harvest')
 
   // The static self-card belongs in the system prompt: it changes only when
   // the card is edited, so the prompt cache survives normal conversation.
@@ -3114,14 +3368,14 @@ export async function apply(ctx) {
 
   const personaTool = {
     name: 'persona',
-    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Each card is headed by a compact 【PERSONA_LOAD】 tag block (auto-derived from the fields unless tagCode is set): write tags as one anchor per line, never as prose. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), peek to turn the periodic screen-check on or off for this session only (the card\'s peekEnabled is just the default for sessions that never chose), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
+    description: 'Create, inspect, or refine the active persona card for this session. The card is injected as the model\'s own self-knowledge, so fill it with real personality: traits, tastes, habits and history, not just a label. Use create when the user starts a character or asks to save an initial persona; include all known fields. Use update when the user refines a trait or a durable new trait is established in the conversation; changes apply from the next model step. The card keeps two audiences apart on purpose: relationship is how the character treats its master (the person who bound this card; in group chat, whoever is marked 主人), relationshipOthers is how it treats everyone else. When the user wants the attitudes separated, fill both. Each card is headed by a compact 【PERSONA_LOAD】 tag block (auto-derived from the fields unless tagCode is set): write tags as one anchor per line, never as prose. Use remember for facts that happened in the story, state for scene/mood/relationship changes, notes to review what this session remembers, forget/pin to curate those notes, enrich when the card is too thin to act from (it calls the current model to fill missing personality fields), peek to turn the periodic screen-check on or off for this session only (the card\'s peekEnabled is just the default for sessions that never chose), look to take one immediate look at the screen when the character genuinely cannot follow without it (only when the card has selfPeek on; rate-limited), and use/off only when the user explicitly asks to switch or stop the role-play. Do not silently replace the user\'s chosen persona.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich', 'peek', 'memory', 'memorize', 'digest', 'forget-memory', 'seeds', 'seed', 'seed-forget'],
+          enum: ['list', 'show', 'create', 'update', 'remember', 'notes', 'forget', 'pin', 'state', 'use', 'off', 'enrich', 'peek', 'look', 'memory', 'memorize', 'digest', 'forget-memory', 'seeds', 'seed', 'seed-forget'],
           description: 'The operation to perform.',
         },
         id: { type: 'string', description: 'Persona id or exact name. Omit to address the active persona, except for use.' },
@@ -3134,6 +3388,7 @@ export async function apply(ctx) {
         useMemes: { type: 'boolean', description: 'Whether the character may send memes/stickers through the send_meme tool. Default false.' },
         memeFrequency: { type: 'number', description: 'Sticker rate as a percentage of replies, 0-100 (default 30). Only used when useMemes is true.' },
         peekEnabled: { type: 'boolean', description: 'Card default: let the persona peek at the master\'s screen on a timer. Each session can override it with action "peek". Default false; only works on Windows.' },
+        selfPeek: { type: 'boolean', description: 'Let the persona decide on its own to look at the screen (action "look"), not on a timer. Default false; only works on Windows. Rate-limited to one look per 15 minutes and 8 per day, per card.' },
         peekEveryMinutes: { type: 'number', description: 'How often the peek timer runs, 0-240 minutes (default 15). 0 means this band never looks. Used as the idle band when peekScheduleEnabled is true.' },
         peekChance: { type: 'number', description: 'Chance (percent) that a peek actually starts a conversation, 0-100 (default 30). Idle band chance when peekScheduleEnabled is true.' },
         peekScheduleEnabled: { type: 'boolean', description: 'Split peek between a busy band and an idle band. When true, peekBusyRanges decides which band applies, and peekBusyEveryMinutes/peekBusyChance replace peekEveryMinutes/peekChance inside those hours. Default false.' },
@@ -3340,6 +3595,8 @@ export async function apply(ctx) {
             : ownerOfSession(store.session(sessionId)),
           tags: args.tags,
         }, sessionId)
+        // 记一笔：这轮模型自己记过了，结束时的正则兜底别再插手。
+        store.memorizeAt.set(sessionId, Date.now())
         return {
           ok: true,
           message: `已写入「${persona.name}」的长期记忆（共 ${count} 条，id: ${record.id}，重要度 ${record.importance}）。`,
@@ -3416,6 +3673,43 @@ export async function apply(ctx) {
       if (action === 'off') {
         await store.off(sessionId)
         return { ok: true, message: '已关闭当前会话的人格，恢复默认助手。' }
+      }
+
+      if (action === 'look') {
+        const { persona } = store.requireActive(sessionId)
+        if (persona.selfPeek !== true) {
+          throw new Error(`「${persona.name}」的卡上没开「主动看一眼」。要开的话，update 时传 selfPeek: true。`)
+        }
+        const at = now()
+        const budget = store.getLookBudget(persona.id, at)
+        if (budget.count >= LOOK_DAILY_MAX) {
+          throw new Error(`今天已经看过 ${budget.count} 次了（上限 ${LOOK_DAILY_MAX} 次），明天再说。`)
+        }
+        if (budget.lastAt > 0) {
+          const waitMs = budget.lastAt + LOOK_COOLDOWN_MS - at
+          if (waitMs > 0) {
+            throw new Error(`刚看过一眼，再过 ${Math.max(1, Math.ceil(waitMs / 60_000))} 分钟才能再看。`)
+          }
+        }
+        const session = typeof store.session === 'function' ? store.session(sessionId) : undefined
+        const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
+        const result = await peek.observe(cwd === '' ? undefined : join(cwd, '.screen'))
+        if (result === null || result === undefined || result.ok !== true) {
+          throw new Error(`没看成：${errorText(result?.error ?? '屏幕抓取失败')}`)
+        }
+        const next = await store.bumpLookBudget(persona.id, at)
+        const seen = result.seen ?? { title: '', process: '', shot: '' }
+        return {
+          ok: true,
+          message: [
+            `前台窗口：${seen.title || '（看不出来）'}｜程序：${seen.process || '（不知道）'}`,
+            seen.shot === '' ? '' : `截图：${seen.shot}（窗口名就够判断的话别去读图，读一张很贵）`,
+            '这只是瞄到的一眼。看完自然接话，别说「截图」「屏幕」「看了一眼」这类词。',
+            `今日已看 ${next.count}/${LOOK_DAILY_MAX} 次。`,
+          ].filter((line) => line !== '').join('\n'),
+          seen,
+          budget: next,
+        }
       }
 
       if (action === 'peek') {
@@ -3586,7 +3880,7 @@ export async function apply(ctx) {
           }
           if (op === 'get') {
             const persona = store.requirePersona(body.id)
-            sendJson(res, 200, { ok: true, persona })
+            sendJson(res, 200, { ok: true, persona, look: lookStatus(store, persona) })
             return
           }
           if (op === 'memory-list') {
@@ -3861,4 +4155,14 @@ export const __test = {
   jsonSafe,
   PersonaStore,
   DOMAIN_SPEC,
+  LOOK_COOLDOWN_MS,
+  LOOK_DAILY_MAX,
+  lookStatus,
+  replaceMasterNames,
+  cleanNameHistory,
+  extractSelfDisclosure,
+  RECALL_COOLDOWN_MS,
+  MAX_MASTER_NAME_HISTORY,
+  RUNTIME_CACHE_MS,
+  HARVEST_SKIP_AFTER_MEMORIZE_MS,
 }
